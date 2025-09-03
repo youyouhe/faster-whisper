@@ -295,3 +295,93 @@ If you are comparing the performance against other Whisper implementations, you 
 ```bash
 OMP_NUM_THREADS=4 python3 my_script.py
 ```
+
+## API Service
+
+This repository also includes a FastAPI service implementation that provides an HTTP API for faster-whisper transcription with SRT support.
+
+### Installation
+
+To use the API service, you need to install the additional dependencies:
+
+```bash
+pip install pydub>=0.25.1 numpy>=1.21.0
+```
+
+### Running the API Service
+
+To start the API service, run:
+
+```bash
+python faster_whisper_api.py
+```
+
+The service will start on `http://0.0.0.0:5001` by default.
+
+### API Endpoints
+
+#### Health Check
+
+```
+GET /health
+```
+
+Returns the health status of the service.
+
+Example response:
+```json
+{
+  "status": "healthy"
+}
+```
+
+#### Transcription
+
+```
+POST /inference
+```
+
+Transcribes an audio file and returns the result in SRT format.
+
+##### Parameters
+
+* `file` (required): The audio file to transcribe (multipart/form-data)
+* `response_format` (optional): The format of the response, currently only supports "srt" (default: "srt")
+* `language` (optional): The language of the audio, use "auto" for automatic detection (default: "auto")
+
+##### Example using curl
+
+```bash
+curl -X POST "http://localhost:5001/inference" \
+  -H "accept: application/json" \
+  -H "Content-Type: multipart/form-data" \
+  -F "file=@audio.mp3" \
+  -F "response_format=srt" \
+  -F "language=en"
+```
+
+##### Example response
+
+```json
+{
+  "code": 0,
+  "msg": "ok",
+  "data": "1\n00:00:00,000 --> 00:00:05,000\nHello, this is a sample transcription.\n\n2\n00:00:05,000 --> 00:00:10,000\nThis is the second segment of the transcription.\n"
+}
+```
+
+### Features
+
+* **SRT Output**: Transcriptions are returned in SRT (SubRip Subtitle) format, ready for use with video players and editing software.
+* **Language Detection**: Automatic language detection with support for specifying the language explicitly.
+* **Large File Handling**: Automatic splitting and processing of large audio files.
+* **Queue Management**: Task queue system to handle multiple requests.
+* **VAD Filtering**: Voice Activity Detection to filter out non-speech segments.
+* **Performance Monitoring**: Detailed timing information for performance analysis.
+
+### Configuration
+
+The API service can be configured using environment variables:
+
+* `MAX_QUEUE_SIZE`: Maximum number of tasks in the queue (default: 10)
+* `MAX_FILE_SIZE`: Maximum file size in MB before splitting (default: 100)
