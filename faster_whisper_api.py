@@ -31,7 +31,7 @@ model_size = "large-v3-turbo"  # Default model size
 
 # Task queue configuration
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "10"))  # Default queue size of 10
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "100"))  # Default max file size in MB
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "20"))  # Default max file size in MB
 task_queue = deque()
 processing_lock = asyncio.Lock()
 current_processing_tasks = 0

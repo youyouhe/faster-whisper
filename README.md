@@ -384,4 +384,4 @@ curl -X POST "http://localhost:5001/inference" \
 The API service can be configured using environment variables:
 
 * `MAX_QUEUE_SIZE`: Maximum number of tasks in the queue (default: 10)
-* `MAX_FILE_SIZE`: Maximum file size in MB before splitting (default: 100)
+* `MAX_FILE_SIZE`: Maximum file size in MB before splitting (default: 20)
