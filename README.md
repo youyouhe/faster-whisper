@@ -385,3 +385,43 @@ The API service can be configured using environment variables:
 
 * `MAX_QUEUE_SIZE`: Maximum number of tasks in the queue (default: 10)
 * `MAX_FILE_SIZE`: Maximum file size in MB before splitting (default: 20)
+* `GPU_DEVICE_ID`: Specify which GPU device to use for inference (default: 0)
+* `API_PORT`: Specify which port the API service should listen on (default: 5001)
+
+### Load Balancer
+
+The repository also includes a load balancer service that can distribute requests across multiple GPU instances. To use it:
+
+1. Start multiple GPU service instances on different ports:
+   ```bash
+   # Terminal 1 - GPU 0 (GTX 1080)
+   export GPU_DEVICE_ID=0
+   export API_PORT=5002
+   python faster_whisper_api.py
+   
+   # Terminal 2 - GPU 1 (GTX 1080)
+   export GPU_DEVICE_ID=1
+   export API_PORT=5003
+   python faster_whisper_api.py
+   
+   # Terminal 3 - GPU 2 (GTX 1080)
+   export GPU_DEVICE_ID=2
+   export API_PORT=5004
+   python faster_whisper_api.py
+   ```
+
+2. Start the load balancer:
+   ```bash
+   export LB_PORT=5001
+   export BACKEND_SERVICES="http://localhost:5002,http://localhost:5003,http://localhost:5004"
+   python load_balancer.py
+   ```
+
+Alternatively, use the provided start script:
+```bash
+./start_all_services.sh
+```
+
+The load balancer will distribute requests across all healthy backend services using a round-robin algorithm and includes health checks.
+
+Note: GPU 3 (GTX 1050 Ti) is not supported due to compute capability limitations.
