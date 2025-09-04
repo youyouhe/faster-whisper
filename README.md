@@ -424,4 +424,43 @@ Alternatively, use the provided start script:
 
 The load balancer will distribute requests across all healthy backend services using a round-robin algorithm and includes health checks.
 
-Note: GPU 3 (GTX 1050 Ti) is not supported due to compute capability limitations.
+### Architecture Overview
+
+The system uses a **distributed processing architecture** designed for high-performance audio transcription:
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Client Apps    │───▶│ Load Balancer   │───▶│ Backend Services │
+│                 │    │   (Port 5001)   │    │  (Ports 5002-5004) │
+│                 │    │                 │    │                 │
+│ • Large Files   │    │ • Queue System  │    │ • GPU Instances │
+│ • Concurrent    │    │ • Round-Robin   │    │ • File Chunking  │
+│   Requests      │    │ • Health Checks  │    │ • Serial Processing│
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+```
+
+### Key Design Principles
+
+**🎯 Concurrency Model**
+- **Load Balancer Level**: True concurrent request processing across multiple GPU backends
+- **Backend Level**: Serial processing within each instance for resource stability
+- **Large File Handling**: Automatic chunking (20MB chunks) for memory efficiency
+
+**📋 Request Flow**
+1. **Client Request** → Load Balancer (Port 5001)
+2. **Queue Management** → Wait for available backend
+3. **Backend Allocation** → Round-robin distribution to healthy services
+4. **File Processing** → Large files auto-chunked, processed serially per backend
+5. **Result Assembly** → Combined and returned to client
+
+**⚙️ Resource Management**
+- **Memory Safety**: 20MB chunk limit prevents memory overflow
+- **GPU Stability**: Serial processing per instance avoids resource contention  
+- **System Health**: Health checks and automatic failover ensure reliability
+- **Timeout Protection**: 30-minute timeout supports large audio files (200MB)
+
+**📊 Performance Characteristics**
+- **Small Files (<20MB)**: Direct processing, fast response
+- **Large Files (>20MB)**: Auto-chunked with progress tracking
+- **Concurrent Users**: Distributed across available GPU instances
+- **Error Recovery**: Chunk-level retry on failure
