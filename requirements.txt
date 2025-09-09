@@ -1,3 +1,4 @@
+# Core faster-whisper dependencies
 ctranslate2>=4.0,<5
 huggingface_hub>=0.13
 tokenizers>=0.13,<1
@@ -6,3 +7,12 @@ av>=11
 tqdm
 pydub>=0.25.1
 numpy>=1.21.0
+
+# API service dependencies
+fastapi>=0.68.0
+uvicorn>=0.15.0
+aiohttp>=3.8.0
+torch>=1.10.0
+
+# Audio processing dependencies
+scipy>=1.7.0

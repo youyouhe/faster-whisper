@@ -16,22 +16,72 @@ from faster_whisper import WhisperModel
 import re
 import asyncio
 from collections import deque
+import signal
 
 # Audio processing libraries
 import pydub
 from pydub import AudioSegment
 import numpy as np
 
-# Initialize FastAPI app
-app = FastAPI(title="faster-whisper ASR Service", version="1.0.0")
+# Initialize FastAPI app with larger client size limit
+app = FastAPI(title="faster-whisper ASR Service", version="1.0.0", client_max_size=500*1024*1024)  # 500MB limit
 
 # Global model instance
 model = None
 model_size = "large-v3-turbo"  # Default model size
+# Get GPU device ID from environment variable
+gpu_device_id = os.getenv('GPU_DEVICE_ID', '0')
+
+# Check if CUDA_VISIBLE_DEVICES is set
+import os
+if 'CUDA_VISIBLE_DEVICES' in os.environ:
+    # When CUDA_VISIBLE_DEVICES is set, each process can only see its assigned GPU(s)
+    # In this case, we should use "cuda" without specifying device ID for ctranslate2
+    visible_devices = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
+    print(f"CUDA_VISIBLE_DEVICES set to {visible_devices}, using cuda")
+    if gpu_device_id == "cpu":
+        device = "cpu"
+    else:
+        # With CUDA_VISIBLE_DEVICES set, we use "cuda" without device ID for ctranslate2
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device = "cuda"
+            else:
+                device = "cpu"
+                print("CUDA not available, falling back to CPU")
+        except Exception as e:
+            device = "cpu"
+            print(f"GPU not usable, falling back to CPU: {e}")
+else:
+    # No CUDA_VISIBLE_DEVICES, use direct device specification
+    # Check if CUDA is available before using GPU
+    try:
+        import torch
+        if torch.cuda.is_available() and gpu_device_id != "cpu":
+            # Use default CUDA device without specifying ID
+            try:
+                device = "cuda"
+                # Test if the device is actually usable
+                torch.zeros(1).to(device)
+            except Exception as e:
+                device = "cpu"
+                print(f"GPU not usable due to compatibility issues, falling back to CPU: {e}")
+        else:
+            device = "cpu"
+            if gpu_device_id == "cpu":
+                print("CPU device explicitly requested")
+            else:
+                print("CUDA not available, falling back to CPU")
+    except (ImportError, ValueError) as e:
+        device = "cpu"
+        print(f"PyTorch not available or invalid GPU device ID, falling back to CPU: {e}")
 
 # Task queue configuration
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "10"))  # Default queue size of 10
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "20"))  # Default max file size in MB
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "3600"))  # Request timeout in seconds (60 minutes)
+CHUNK_TIMEOUT = int(os.getenv("CHUNK_TIMEOUT", "1200"))  # Individual chunk timeout in seconds (20 minutes)
 task_queue = deque()
 processing_lock = asyncio.Lock()
 current_processing_tasks = 0
@@ -223,192 +273,208 @@ def format_timestamp_srt(seconds):
     
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-def transcribe_to_srt(file_path: str, language: str = "auto", max_words_per_segment: int = 15):
-    """Transcribe audio file to SRT format"""
+def transcribe_to_srt(file_path: str, language: str = "auto", max_words_per_segment: int = 15, timeout: int = 1800):
+    """Transcribe audio file to SRT format with timeout protection"""
     global model
     
-    # Get file information for debugging
-    file_name = os.path.basename(file_path)
-    file_size = os.path.getsize(file_path)
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Transcription timed out after {timeout} seconds")
     
-    # Start timing for performance metrics
-    total_start_time = time.time()
+    # Set up signal handler for timeout
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(timeout)
     
     try:
-        # Timing for language detection
-        lang_detect_time = 0
-        # Detect language if auto
-        if language == "auto":
-            lang_detect_start = time.time()
-            # First do a quick language detection
-            temp_model = WhisperModel("tiny", device="cuda" if model.model.device == "cuda" else "cpu", compute_type="int8")
-            temp_segments, temp_info = temp_model.transcribe(file_path, beam_size=1)
-            language = temp_info.language
-            lang_detect_time = time.time() - lang_detect_start
-            print(f"Debug Info - Language Detection Time: {lang_detect_time:.2f}s")
+        # Get file information for debugging
+        file_name = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
         
-        # Timing for main transcription with VAD
-        transcription_start_time = time.time()
-        print(f"Debug Info - Starting transcription with VAD filter")
-        # Transcribe with word timestamps for better control
-        segments, info = model.transcribe(
-            file_path,
-            beam_size=5,
-            word_timestamps=True,
-            language=language if language != "auto" else None,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500)
-        )
+        # Start timing for performance metrics
+        total_start_time = time.time()
         
-        # Convert segments to list to ensure all transcription is complete
-        segments_list = list(segments)
-        print(f"Debug Info - Converted {len(segments_list)} segments to list")
-        
-        transcription_time = time.time() - transcription_start_time
-        print(f"Debug Info - Transcription completed")
-        
-        # Calculate performance metrics after all transcription work is done
-        total_time = time.time() - total_start_time
-        audio_duration = info.duration if info.duration else 0
-        speed_ratio = audio_duration / total_time if total_time > 0 else 0
-        
-        # Timing for SRT generation
-        srt_generation_start = time.time()
-        
-        # Generate SRT content
-        srt_lines = []
-        segment_index = 1
-        total_words = 0
-        
-        # Debug timing for processing
-        processing_start = time.time()
-        long_segments_count = 0
-        short_segments_count = 0
-        total_chunks = 0
-        
-        print(f"Debug Info - Starting SRT generation for {len(segments_list)} segments")
-        
-        # Process all segments
-        for segment_idx, segment in enumerate(segments_list):
-            segment_start = time.time()
+        try:
+            # Timing for language detection
+            lang_detect_time = 0
+            # Detect language if auto
+            if language == "auto":
+                lang_detect_start = time.time()
+                # First do a quick language detection
+                temp_model = WhisperModel("tiny", device=device if model else "cpu", compute_type="int8")
+                temp_segments, temp_info = temp_model.transcribe(file_path, beam_size=1)
+                language = temp_info.language
+                lang_detect_time = time.time() - lang_detect_start
+                print(f"Debug Info - Language Detection Time: {lang_detect_time:.2f}s")
             
-            if segment.words:
-                total_words += len(segment.words)
+            # Timing for main transcription with VAD
+            transcription_start_time = time.time()
+            print(f"Debug Info - Starting transcription with VAD filter")
+            # Transcribe with word timestamps for better control
+            segments, info = model.transcribe(
+                file_path,
+                beam_size=5,
+                word_timestamps=True,
+                language=language if language != "auto" else None,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500)
+            )
             
-            # Only process non-empty segments
-            if segment.text.strip():
-                # Check if we need to split this segment
-                if segment.words and len(segment.words) > max_words_per_segment:
-                    long_segments_count += 1
-                    # Split into smaller chunks
-                    words = segment.words
-                    chunk_processing_start = time.time()
-                    for i in range(0, len(words), max_words_per_segment):
-                        chunk_words = words[i:i + max_words_per_segment]
-                        if chunk_words:
-                            total_chunks += 1
-                            start_time = chunk_words[0].start
-                            end_time = chunk_words[-1].end
-                            # Extract words and clean up spacing
-                            word_extract_start = time.time()
-                            word_texts = [word.word for word in chunk_words]
-                            word_extract_time = time.time() - word_extract_start
-                            
-                            text_join_start = time.time()
-                            text = "".join(word_texts)  # For Chinese, no spaces needed
-                            text_join_time = time.time() - text_join_start
-                            
-                            clean_start = time.time()
-                            # Only clean text if it's not empty
-                            if text.strip():
-                                text = clean_text(text)
-                            clean_time = time.time() - clean_start
-                            
-                            if text.strip():  # Only add non-empty segments
-                                srt_lines.append(f"{segment_index}")
-                                srt_lines.append(f"{format_timestamp_srt(start_time)} --> {format_timestamp_srt(end_time)}")
-                                srt_lines.append(f"{text}")
-                                srt_lines.append("")  # Empty line
-                                segment_index += 1
-                            
-                            # Log chunk processing time periodically
-                            if total_chunks % 20 == 0:
-                                chunk_total_time = time.time() - chunk_processing_start
-                                print(f"Debug Info - Processed {total_chunks} chunks, "
-                                      f"Word extract: {word_extract_time:.6f}s, "
-                                      f"Text join: {text_join_time:.6f}s, "
-                                      f"Clean: {clean_time:.6f}s, "
-                                      f"Total chunk time: {chunk_total_time:.6f}s")
-                                chunk_processing_start = time.time()
-                else:
-                    short_segments_count += 1
-                    # No splitting needed, process as is
-                    clean_start = time.time()
-                    cleaned_text = clean_text(segment.text)
-                    clean_time = time.time() - clean_start
-                    
-                    if cleaned_text.strip():  # Only add non-empty segments
-                        srt_lines.append(f"{segment_index}")
-                        srt_lines.append(f"{format_timestamp_srt(segment.start)} --> {format_timestamp_srt(segment.end)}")
-                        srt_lines.append(f"{cleaned_text}")
-                        srt_lines.append("")  # Empty line
-                        segment_index += 1
+            # Convert segments to list to ensure all transcription is complete
+            segments_list = list(segments)
+            print(f"Debug Info - Converted {len(segments_list)} segments to list")
+            
+            transcription_time = time.time() - transcription_start_time
+            print(f"Debug Info - Transcription completed")
+            
+            # Calculate performance metrics after all transcription work is done
+            total_time = time.time() - total_start_time
+            audio_duration = info.duration if info.duration else 0
+            speed_ratio = audio_duration / total_time if total_time > 0 else 0
+            
+            # Timing for SRT generation
+            srt_generation_start = time.time()
+            
+            # Generate SRT content
+            srt_lines = []
+            segment_index = 1
+            total_words = 0
+            
+            # Debug timing for processing
+            processing_start = time.time()
+            long_segments_count = 0
+            short_segments_count = 0
+            total_chunks = 0
+            
+            print(f"Debug Info - Starting SRT generation for {len(segments_list)} segments")
+            
+            # Process all segments
+            for segment_idx, segment in enumerate(segments_list):
+                segment_start = time.time()
                 
-                # Log segment processing time periodically
-                if (long_segments_count + short_segments_count) % 10 == 0:
-                    segment_time = time.time() - segment_start
-                    print(f"Debug Info - Processed {long_segments_count + short_segments_count} segments, "
-                          f"Last segment time: {segment_time:.6f}s")
+                if segment.words:
+                    total_words += len(segment.words)
+                
+                # Only process non-empty segments
+                if segment.text.strip():
+                    # Check if we need to split this segment
+                    if segment.words and len(segment.words) > max_words_per_segment:
+                        long_segments_count += 1
+                        # Split into smaller chunks
+                        words = segment.words
+                        chunk_processing_start = time.time()
+                        for i in range(0, len(words), max_words_per_segment):
+                            chunk_words = words[i:i + max_words_per_segment]
+                            if chunk_words:
+                                total_chunks += 1
+                                start_time = chunk_words[0].start
+                                end_time = chunk_words[-1].end
+                                # Extract words and clean up spacing
+                                word_extract_start = time.time()
+                                word_texts = [word.word for word in chunk_words]
+                                word_extract_time = time.time() - word_extract_start
+                                
+                                text_join_start = time.time()
+                                text = "".join(word_texts)  # For Chinese, no spaces needed
+                                text_join_time = time.time() - text_join_start
+                                
+                                clean_start = time.time()
+                                # Only clean text if it's not empty
+                                if text.strip():
+                                    text = clean_text(text)
+                                clean_time = time.time() - clean_start
+                                
+                                if text.strip():  # Only add non-empty segments
+                                    srt_lines.append(f"{segment_index}")
+                                    srt_lines.append(f"{format_timestamp_srt(start_time)} --> {format_timestamp_srt(end_time)}")
+                                    srt_lines.append(f"{text}")
+                                    srt_lines.append("")  # Empty line
+                                    segment_index += 1
+                                
+                                # Log chunk processing time periodically
+                                if total_chunks % 20 == 0:
+                                    chunk_total_time = time.time() - chunk_processing_start
+                                    print(f"Debug Info - Processed {total_chunks} chunks, "
+                                          f"Word extract: {word_extract_time:.6f}s, "
+                                          f"Text join: {text_join_time:.6f}s, "
+                                          f"Clean: {clean_time:.6f}s, "
+                                          f"Total chunk time: {chunk_total_time:.6f}s")
+                                    chunk_processing_start = time.time()
+                    else:
+                        short_segments_count += 1
+                        # No splitting needed, process as is
+                        clean_start = time.time()
+                        cleaned_text = clean_text(segment.text)
+                        clean_time = time.time() - clean_start
+                        
+                        if cleaned_text.strip():  # Only add non-empty segments
+                            srt_lines.append(f"{segment_index}")
+                            srt_lines.append(f"{format_timestamp_srt(segment.start)} --> {format_timestamp_srt(segment.end)}")
+                            srt_lines.append(f"{cleaned_text}")
+                            srt_lines.append("")  # Empty line
+                            segment_index += 1
+                    
+                    # Log segment processing time periodically
+                    if (long_segments_count + short_segments_count) % 10 == 0:
+                        segment_time = time.time() - segment_start
+                        print(f"Debug Info - Processed {long_segments_count + short_segments_count} segments, "
+                              f"Last segment time: {segment_time:.6f}s")
+                
+                # Log overall progress periodically
+                if segment_idx > 0 and segment_idx % 20 == 0:
+                    elapsed = time.time() - processing_start
+                    print(f"Debug Info - Processed {segment_idx}/{len(segments_list)} segments in {elapsed:.2f}s")
             
-            # Log overall progress periodically
-            if segment_idx > 0 and segment_idx % 20 == 0:
-                elapsed = time.time() - processing_start
-                print(f"Debug Info - Processed {segment_idx}/{len(segments_list)} segments in {elapsed:.2f}s")
-        
-        processing_time = time.time() - processing_start
-        print(f"Debug Info - SRT processing completed: {long_segments_count} long segments, "
-              f"{short_segments_count} short segments, {total_chunks} chunks, "
-              f"Processing time: {processing_time:.2f}s")
-        
-        # Join all lines at once for better performance
-        join_start = time.time()
-        srt_content = "\n".join(srt_lines).strip()
-        join_time = time.time() - join_start
-        print(f"Debug Info - SRT content joined in {join_time:.6f}s")
-        
-        # Calculate total SRT generation time
-        srt_generation_time = time.time() - srt_generation_start
-        print(f"Debug Info - SRT generation time: {srt_generation_time:.2f}s (Processing: {processing_time:.2f}s, Join: {join_time:.6f}s)")
-        
-        # Print debug information
-        print(f"Debug Info - File: {file_name}, Size: {file_size} bytes")
-        print(f"Debug Info - Language: {info.language}, Duration: {audio_duration:.2f}s")
-        print(f"Debug Info - Total Time: {total_time:.2f}s, Speed Ratio: {speed_ratio:.2f}x")
-        if lang_detect_time > 0:
-            print(f"Debug Info - Language Detection: {lang_detect_time:.2f}s")
-        print(f"Debug Info - Transcription (VAD + Whisper): {transcription_time:.2f}s")
-        print(f"Debug Info - SRT Generation: {srt_generation_time:.2f}s")
-        print(f"Debug Info - Segments: {segment_index-1}, Words: {total_words}")
-        
-        # Debug return timing
-        return_start = time.time()
-        result = srt_content.strip()
-        return_time = time.time() - return_start
-        print(f"Debug Info - Function return preparation time: {return_time:.6f}s")
-        
-        return result
-        
+            processing_time = time.time() - processing_start
+            print(f"Debug Info - SRT processing completed: {long_segments_count} long segments, "
+                  f"{short_segments_count} short segments, {total_chunks} chunks, "
+                  f"Processing time: {processing_time:.2f}s")
+            
+            # Join all lines at once for better performance
+            join_start = time.time()
+            srt_content = "\n".join(srt_lines).strip()
+            join_time = time.time() - join_start
+            print(f"Debug Info - SRT content joined in {join_time:.6f}s")
+            
+            # Calculate total SRT generation time
+            srt_generation_time = time.time() - srt_generation_start
+            print(f"Debug Info - SRT generation time: {srt_generation_time:.2f}s (Processing: {processing_time:.2f}s, Join: {join_time:.6f}s)")
+            
+            # Print debug information
+            print(f"Debug Info - File: {file_name}, Size: {file_size} bytes")
+            print(f"Debug Info - Language: {info.language}, Duration: {audio_duration:.2f}s")
+            print(f"Debug Info - Total Time: {total_time:.2f}s, Speed Ratio: {speed_ratio:.2f}x")
+            if lang_detect_time > 0:
+                print(f"Debug Info - Language Detection: {lang_detect_time:.2f}s")
+            print(f"Debug Info - Transcription (VAD + Whisper): {transcription_time:.2f}s")
+            print(f"Debug Info - SRT Generation: {srt_generation_time:.2f}s")
+            print(f"Debug Info - Segments: {segment_index-1}, Words: {total_words}")
+            
+            # Debug return timing
+            return_start = time.time()
+            result = srt_content.strip()
+            return_time = time.time() - return_start
+            print(f"Debug Info - Function return preparation time: {return_time:.6f}s")
+            
+            return result
+            
+        except TimeoutError as e:
+            raise HTTPException(status_code=504, detail=f"Transcription timeout: {str(e)}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Transcription error: {str(e)}")
+        finally:
+            # Clean up signal handler
+            signal.alarm(0)  # Cancel the alarm
+            signal.signal(signal.SIGALRM, old_handler)  # Restore original handler
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize model on startup"""
     global model
-    print(f"Initializing {model_size} model...")
+    print(f"Initializing {model_size} model on device {device}...")
     import time
     model_init_start = time.time()
-    model = WhisperModel(model_size, device="cuda", compute_type="int8")
+    model = WhisperModel(model_size, device=device, compute_type="int8")
     model_init_time = time.time() - model_init_start
     print(f"Model initialized successfully in {model_init_time:.2f}s!")
 
@@ -510,8 +576,8 @@ async def process_queue():
                     except:
                         chunk_durations.append(0.0)
                     
-                    # Process chunk
-                    chunk_srt = transcribe_to_srt(chunk_file, language)
+                    # Process chunk with individual chunk timeout
+                    chunk_srt = transcribe_to_srt(chunk_file, language, timeout=CHUNK_TIMEOUT)
                     srt_results.append(chunk_srt)
                     
                     chunk_time = time.time() - chunk_start
@@ -528,10 +594,10 @@ async def process_queue():
                         os.unlink(chunk_file)
             else:
                 # File doesn't need splitting or splitting failed
-                srt_content = transcribe_to_srt(temp_file_path, language)
+                srt_content = transcribe_to_srt(temp_file_path, language, timeout=CHUNK_TIMEOUT)
         else:
             # File is small enough, process normally
-            srt_content = transcribe_to_srt(temp_file_path, language)
+            srt_content = transcribe_to_srt(temp_file_path, language, timeout=CHUNK_TIMEOUT)
         
         # Process the transcription
         srt_start = time.time()
@@ -579,4 +645,5 @@ async def process_queue():
             asyncio.create_task(process_queue())
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5001)
+    port = int(os.getenv("API_PORT", "5001"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

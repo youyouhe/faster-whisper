@@ -21,10 +21,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load backend services from environment variables
-BACKEND_SERVICES = os.getenv("BACKEND_SERVICES", "http://localhost:5002,http://localhost:5003,http://localhost:5004").split(",")
+BACKEND_SERVICES = os.getenv("BACKEND_SERVICES", "http://localhost:5002,http://localhost:5003,http://localhost:5004,http://localhost:5005").split(",") 
 HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "30"))  # seconds
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))  # Maximum requests in queue
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "1800"))  # seconds (30 minutes for large audio files)
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "3600"))  # seconds (60 minutes for large audio files)
+CHUNK_PROCESSING_TIMEOUT = int(os.getenv("CHUNK_PROCESSING_TIMEOUT", "600"))  # seconds (10 minutes per chunk)
+LARGE_FILE_THRESHOLD = int(os.getenv("LARGE_FILE_THRESHOLD", "50"))  # MB
+HEALTH_CHECK_TIMEOUT = int(os.getenv("HEALTH_CHECK_TIMEOUT", "15"))  # seconds
 
 @dataclass
 class QueuedRequest:
@@ -35,6 +38,7 @@ class QueuedRequest:
     form_data: Optional[aiohttp.FormData]
     future: asyncio.Future
     timestamp: float
+    file_size: Optional[int] = None  # Store file size for progressive timeout
 
 # Global state
 BACKEND_STATUS = {service: True for service in BACKEND_SERVICES}  # Assume all healthy initially
@@ -65,7 +69,7 @@ async def health_check_task():
                     
                     try:
                         logger.info(f"Checking health of {service}")
-                        timeout = aiohttp.ClientTimeout(total=10, connect=5)
+                        timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT, connect=5)
                         async with session.get(f"{service}/health", timeout=timeout) as response:
                             if response.status == 200:
                                 if not BACKEND_STATUS[service]:  # Log only status changes
@@ -127,6 +131,7 @@ async def add_request_to_queue(request: web.Request, request_body: bytes) -> asy
     
     # Handle multipart data
     form_data = None
+    file_size = None
     if request.content_type and 'multipart/form-data' in request.content_type:
         # Parse multipart data and store as FormData
         try:
@@ -142,6 +147,8 @@ async def add_request_to_queue(request: web.Request, request_body: bytes) -> asy
                     # File field - read the content
                     content = await field.read()
                     form_data.add_field(field.name, content, filename=field.filename, content_type=field.content_type)
+                    # Store file size for progressive timeout
+                    file_size = len(content)
                 else:
                     # Regular field
                     content = await field.text()
@@ -149,6 +156,9 @@ async def add_request_to_queue(request: web.Request, request_body: bytes) -> asy
         except Exception as e:
             logger.error(f"Error parsing multipart data: {e}")
             form_data = None
+    else:
+        # For non-multipart requests, use request body size
+        file_size = len(request_body)
     
     queued_request = QueuedRequest(
         request_id=request_id,
@@ -156,11 +166,14 @@ async def add_request_to_queue(request: web.Request, request_body: bytes) -> asy
         request_body=request_body,
         form_data=form_data,
         future=future,
-        timestamp=asyncio.get_event_loop().time()
+        timestamp=asyncio.get_event_loop().time(),
+        file_size=file_size
     )
     
     REQUEST_QUEUE.append(queued_request)
     logger.info(f"Added request {request_id} to queue. Queue length: {len(REQUEST_QUEUE)}")
+    if file_size:
+        logger.info(f"Request {request_id} file size: {file_size / (1024*1024):.2f}MB")
     return future
 
 async def process_queue():
@@ -197,13 +210,34 @@ async def process_queue():
             logger.error(f"Error in queue processor: {e}")
             await asyncio.sleep(1)
 
+def calculate_request_timeout(file_size: Optional[int]) -> int:
+    """Calculate progressive timeout based on file size"""
+    if not file_size:
+        return REQUEST_TIMEOUT
+    
+    file_size_mb = file_size / (1024 * 1024)
+    
+    # Progressive timeout: 
+    # - Small files (< 10MB): 30 minutes
+    # - Medium files (10-50MB): 45 minutes  
+    # - Large files (> 50MB): 60 minutes
+    if file_size_mb < 10:
+        return 1800  # 30 minutes
+    elif file_size_mb < 50:
+        return 2700  # 45 minutes
+    else:
+        return REQUEST_TIMEOUT  # 60 minutes
+
 async def process_queued_request(backend: str, queued_request: QueuedRequest):
     """Process a single queued request on a specific backend"""
     try:
-        # Process request with timeout
+        # Process request with progressive timeout
+        timeout = calculate_request_timeout(queued_request.file_size)
+        logger.info(f"Processing request {queued_request.request_id} with timeout {timeout}s")
+        
         result = await asyncio.wait_for(
             process_request_on_backend(backend, queued_request.request, queued_request.request_body, queued_request.form_data),
-            timeout=REQUEST_TIMEOUT
+            timeout=timeout
         )
         
         # Fulfill the future
@@ -229,7 +263,20 @@ async def process_queued_request(backend: str, queued_request: QueuedRequest):
 async def process_request_on_backend(backend: str, request: web.Request, request_body: bytes, form_data: Optional[aiohttp.FormData] = None) -> web.Response:
     """Process a request on a specific backend"""
     try:
-        async with ClientSession() as session:
+        # Use progressive connection timeout based on file size
+        file_size = len(request_body) if request_body else 0
+        connect_timeout = 30  # Base connection timeout
+        total_timeout = calculate_request_timeout(file_size)
+        
+        # Create session with longer timeouts for large files
+        timeout = aiohttp.ClientTimeout(
+            total=total_timeout,
+            connect=connect_timeout,
+            sock_connect=connect_timeout,
+            sock_read=total_timeout
+        )
+        
+        async with ClientSession(timeout=timeout) as session:
             # Prepare headers
             headers = {}
             for key, value in request.headers.items():
@@ -286,6 +333,10 @@ async def inference_handler(request):
             logger.error("No healthy backends available")
             raise web.HTTPServiceUnavailable(reason="No healthy backend services available")
         
+        # Calculate progressive timeout based on file size
+        timeout = calculate_request_timeout(len(request_body))
+        logger.info(f"Using progressive timeout of {timeout}s for request {request_id}")
+        
         # Try to get an idle backend immediately
         backend = get_idle_backend()
         if backend:
@@ -297,7 +348,7 @@ async def inference_handler(request):
                 # Process request immediately
                 result = await asyncio.wait_for(
                     process_request_on_backend(backend, request, request_body),
-                    timeout=REQUEST_TIMEOUT
+                    timeout=timeout
                 )
                 BACKEND_BUSY[backend] = False
                 logger.info(f"Request {request_id} completed immediately on backend {backend}")
@@ -318,8 +369,8 @@ async def inference_handler(request):
             future = await add_request_to_queue(request, request_body)
             logger.info(f"Waiting for queued request {request_id} to be processed")
             
-            # Wait for the result with timeout
-            result = await asyncio.wait_for(future, timeout=REQUEST_TIMEOUT)
+            # Wait for the result with progressive timeout
+            result = await asyncio.wait_for(future, timeout=timeout)
             logger.info(f"Queued request {request_id} completed successfully")
             return result
             
