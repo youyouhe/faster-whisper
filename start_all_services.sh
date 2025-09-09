@@ -4,6 +4,12 @@
 # Exit on any error
 set -e
 
+# Activate virtual environment
+source faster-whisper-env/bin/activate
+
+# Set LD_LIBRARY_PATH for CUDA
+export LD_LIBRARY_PATH=$(python3 -c "import nvidia.cublas.lib; import nvidia.cudnn.lib; print(nvidia.cublas.lib.__path__[0] + ':' + nvidia.cudnn.lib.__path__[0])")
+
 # Function to clean up processes on exit
 cleanup() {
     echo ""
@@ -54,8 +60,13 @@ python faster_whisper_api.py &
 GPU2_PID=$!
 echo "Started GPU 2 service on port 5004 (PID: $GPU2_PID)"
 
-# Note: GPU 3 (GTX 1050 Ti) is not supported due to compute capability limitations
-echo "Note: GPU 3 (GTX 1050 Ti) is not supported due to compute capability limitations"
+# GPU 3 on port 5005
+export CUDA_VISIBLE_DEVICES=3
+export API_PORT=5005
+export GPU_DEVICE_ID=3
+python faster_whisper_api.py &
+GPU3_PID=$!
+echo "Started GPU 3 service on port 5003 (PID: $GPU3_PID)"
 
 # Wait a moment for services to initialize
 sleep 30

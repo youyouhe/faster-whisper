@@ -394,17 +394,17 @@ The repository also includes a load balancer service that can distribute request
 
 1. Start multiple GPU service instances on different ports:
    ```bash
-   # Terminal 1 - GPU 0 (GTX 1080)
+   # Terminal 1 - GPU 0 
    export GPU_DEVICE_ID=0
    export API_PORT=5002
    python faster_whisper_api.py
    
-   # Terminal 2 - GPU 1 (GTX 1080)
+   # Terminal 2 - GPU 1 
    export GPU_DEVICE_ID=1
    export API_PORT=5003
    python faster_whisper_api.py
    
-   # Terminal 3 - GPU 2 (GTX 1080)
+   # Terminal 3 - GPU 2 
    export GPU_DEVICE_ID=2
    export API_PORT=5004
    python faster_whisper_api.py

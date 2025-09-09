@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  faster-whisper:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: faster-whisper-service
+    ports:
+      - "5001:5001"  # Load balancer
+      - "5002:5002"  # GPU service 0
+      - "5003:5003"  # GPU service 1
+      - "5004:5004"  # GPU service 2
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 3
+              capabilities: [gpu]
+    volumes:
+      - ./models:/app/models  # Mount models directory
+      - ./logs:/app/logs      # Mount logs directory
+    restart: unless-stopped
