@@ -6,6 +6,7 @@ __pycache__/
 
 # Distribution / Packaging
 venv/
+faster-whisper-env/
 
 # Unit Test
 .pytest_cache/
@@ -13,3 +14,18 @@ venv/
 # Ignore IDE, Editor Files
 .idea/
 .vscode/
+
+# Log files
+*.log
+
+# Backup files
+*.backup
+
+# Python egg info
+*.egg-info/
+
+# Audio files
+*.wav
+
+# Test data
+tests/data/test.wav
