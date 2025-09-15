@@ -74,7 +74,7 @@ sleep 30
 # Start load balancer on port 5001
 echo "Starting load balancer on port 5001"
 export LB_PORT=5001
-export BACKEND_SERVICES="http://localhost:5002,http://localhost:5003,http://localhost:5004"
+export BACKEND_SERVICES="http://localhost:5002,http://localhost:5003,http://localhost:5004,http://localhost:5005"
 export REQUEST_TIMEOUT=1800  # 30 minutes for large audio files
 export MAX_QUEUE_SIZE=100  # Maximum requests in queue
 export HEALTH_CHECK_INTERVAL=30  # Health check interval
