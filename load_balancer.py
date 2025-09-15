@@ -323,16 +323,57 @@ async def inference_handler(request):
         logger.info(f"Request content length: {request.content_length}")
         logger.info(f"Request content type: {request.headers.get('Content-Type')}")
         
-        # Read request body once
-        request_body = await request.read()
-        logger.info(f"Request body size: {len(request_body)} bytes")
-        
+        # Read request body once - 优化流式处理
+        try:
+            # 检查是否是multipart/form-data上传
+            content_type = request.headers.get('Content-Type', '')
+            if 'multipart/form-data' in content_type:
+                # 流式读取multipart数据
+                logger.info(f"开始流式接收multipart数据: {request.content_length} bytes")
+
+                # 使用MultipartReader流式处理
+                multipart_reader = await request.multipart()
+
+                request_body = b''
+                total_read = 0
+                chunk_size = 1024 * 1024  # 1MB chunks
+
+                async for field in multipart_reader:
+                    if field.name == 'file':
+                        # 流式读取文件数据
+                        while True:
+                            chunk = await field.read_chunk(chunk_size)
+                            if not chunk:
+                                break
+                            request_body += chunk
+                            total_read += len(chunk)
+
+                            # 每10MB输出进度
+                            if total_read % (10 * 1024 * 1024) == 0:
+                                logger.info(f"已接收数据: {total_read / (1024*1024):.1f}MB")
+
+                        logger.info(f"✅ 文件数据接收完成！总大小: {total_read} bytes")
+                    else:
+                        # 读取其他表单字段
+                        field_data = await field.read()
+                        request_body += field_data
+
+                logger.info(f"✅ Multipart数据接收完成！总大小: {len(request_body)} bytes")
+            else:
+                # 非multipart数据，直接读取
+                request_body = await request.read()
+                logger.info(f"Request body size: {len(request_body)} bytes")
+
+        except Exception as e:
+            logger.error(f"读取请求体失败: {e}")
+            raise web.HTTPInternalServerError(reason=f"Failed to read request body: {e}")
+
         # Check if there are any healthy backends
         healthy_backends = get_healthy_backends()
         if not healthy_backends:
             logger.error("No healthy backends available")
             raise web.HTTPServiceUnavailable(reason="No healthy backend services available")
-        
+
         # Calculate progressive timeout based on file size
         timeout = calculate_request_timeout(len(request_body))
         logger.info(f"Using progressive timeout of {timeout}s for request {request_id}")
