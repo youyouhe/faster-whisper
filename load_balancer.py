@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 BACKEND_SERVICES = os.getenv("BACKEND_SERVICES", "http://localhost:5002,http://localhost:5003,http://localhost:5004,http://localhost:5005").split(",") 
 HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "30"))  # seconds
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))  # Maximum requests in queue
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "3600"))  # seconds (60 minutes for large audio files)
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "1800"))  # seconds (30 minutes for large audio files)
 CHUNK_PROCESSING_TIMEOUT = int(os.getenv("CHUNK_PROCESSING_TIMEOUT", "600"))  # seconds (10 minutes per chunk)
 LARGE_FILE_THRESHOLD = int(os.getenv("LARGE_FILE_THRESHOLD", "50"))  # MB
 HEALTH_CHECK_TIMEOUT = int(os.getenv("HEALTH_CHECK_TIMEOUT", "15"))  # seconds
@@ -323,50 +323,45 @@ async def inference_handler(request):
         logger.info(f"Request content length: {request.content_length}")
         logger.info(f"Request content type: {request.headers.get('Content-Type')}")
         
-        # Read request body once - 优化流式处理
+        # Read request body once - 简化版本，避免复杂的流式处理
         try:
             # 检查是否是multipart/form-data上传
             content_type = request.headers.get('Content-Type', '')
             if 'multipart/form-data' in content_type:
-                # 流式读取multipart数据
-                logger.info(f"开始流式接收multipart数据: {request.content_length} bytes")
+                # 使用更简单的方式读取multipart数据
+                logger.info(f"开始接收multipart数据: {request.content_length} bytes")
 
-                # 使用MultipartReader流式处理
-                multipart_reader = await request.multipart()
-
-                request_body = b''
-                total_read = 0
-                chunk_size = 1024 * 1024  # 1MB chunks
-
-                async for field in multipart_reader:
-                    if field.name == 'file':
-                        # 流式读取文件数据
-                        while True:
-                            chunk = await field.read_chunk(chunk_size)
-                            if not chunk:
-                                break
-                            request_body += chunk
-                            total_read += len(chunk)
-
-                            # 每10MB输出进度
-                            if total_read % (10 * 1024 * 1024) == 0:
-                                logger.info(f"已接收数据: {total_read / (1024*1024):.1f}MB")
-
-                        logger.info(f"✅ 文件数据接收完成！总大小: {total_read} bytes")
-                    else:
-                        # 读取其他表单字段
-                        field_data = await field.read()
-                        request_body += field_data
-
-                logger.info(f"✅ Multipart数据接收完成！总大小: {len(request_body)} bytes")
+                # 直接读取整个请求体，但增加超时保护
+                try:
+                    request_body = await asyncio.wait_for(
+                        request.read(),
+                        timeout=300.0  # 5分钟读取超时
+                    )
+                    logger.info(f"✅ Multipart数据接收完成！总大小: {len(request_body)} bytes")
+                except asyncio.TimeoutError:
+                    logger.error(f"读取Multipart数据超时 (5分钟)")
+                    raise web.HTTPRequestTimeout(reason="Multipart data read timeout (5 minutes)")
+                except Exception as read_error:
+                    logger.error(f"读取Multipart数据失败: {read_error}")
+                    raise web.HTTPInternalServerError(reason=f"Failed to read multipart data: {read_error}")
             else:
                 # 非multipart数据，直接读取
-                request_body = await request.read()
-                logger.info(f"Request body size: {len(request_body)} bytes")
+                try:
+                    request_body = await asyncio.wait_for(
+                        request.read(),
+                        timeout=60.0  # 1分钟读取超时
+                    )
+                    logger.info(f"Request body size: {len(request_body)} bytes")
+                except asyncio.TimeoutError:
+                    logger.error(f"读取请求体超时 (1分钟)")
+                    raise web.HTTPRequestTimeout(reason="Request body read timeout (1 minute)")
+                except Exception as read_error:
+                    logger.error(f"读取请求体失败: {read_error}")
+                    raise web.HTTPInternalServerError(reason=f"Failed to read request body: {read_error}")
 
         except Exception as e:
-            logger.error(f"读取请求体失败: {e}")
-            raise web.HTTPInternalServerError(reason=f"Failed to read request body: {e}")
+            logger.error(f"请求体处理失败: {e}")
+            raise web.HTTPInternalServerError(reason=f"Request processing failed: {e}")
 
         # Check if there are any healthy backends
         healthy_backends = get_healthy_backends()
