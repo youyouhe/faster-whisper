@@ -81,7 +81,7 @@ else:
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "10"))  # Default queue size of 10
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "20"))  # Default max file size in MB
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "3600"))  # Request timeout in seconds (60 minutes)
-CHUNK_TIMEOUT = int(os.getenv("CHUNK_TIMEOUT", "1200"))  # Individual chunk timeout in seconds (20 minutes)
+CHUNK_TIMEOUT = int(os.getenv("CHUNK_TIMEOUT", "3600"))  # Individual chunk timeout in seconds (60 minutes - for large files)
 task_queue = deque()
 processing_lock = asyncio.Lock()
 current_processing_tasks = 0
@@ -274,15 +274,21 @@ def format_timestamp_srt(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 def transcribe_to_srt(file_path: str, language: str = "auto", max_words_per_segment: int = 15, timeout: int = 1800):
-    """Transcribe audio file to SRT format with timeout protection"""
+    """Transcribe audio file to SRT format with enhanced timeout protection and progress monitoring"""
     global model
-    
+
+    # 根据文件大小动态调整超时时间
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    dynamic_timeout = max(timeout, int(file_size_mb * 30))  # 每MB额外30秒
+
     def timeout_handler(signum, frame):
-        raise TimeoutError(f"Transcription timed out after {timeout} seconds")
-    
+        raise TimeoutError(f"Transcription timed out after {dynamic_timeout} seconds (file: {file_size_mb:.1f}MB)")
+
     # Set up signal handler for timeout
     old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(timeout)
+    signal.alarm(dynamic_timeout)
+
+    print(f"🎵 开始转录: {os.path.basename(file_path)} ({file_size_mb:.1f}MB), 超时时间: {dynamic_timeout}秒")
     
     try:
         # Get file information for debugging
@@ -489,41 +495,59 @@ async def inference(
     response_format: str = Form("srt"),
     language: str = Form("auto")
 ):
-    """ASR inference endpoint compatible with existing clients"""
-    
+    """ASR inference endpoint compatible with existing clients - 优化流式上传"""
+
     # Validate response format
     if response_format != "srt":
         raise HTTPException(status_code=400, detail="Only SRT format is supported")
-    
+
     # Check queue size
     if len(task_queue) >= MAX_QUEUE_SIZE:
         raise HTTPException(status_code=503, detail=f"Service busy, queue is full (max {MAX_QUEUE_SIZE} tasks)")
-    
+
     # Create temporary file
     temp_file_path = None
     try:
-        # Save uploaded file to temporary location
+        # Save uploaded file to temporary location using streaming
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1] if file.filename else ".tmp") as temp_file:
             temp_file_path = temp_file.name
-            contents = await file.read()
-            temp_file.write(contents)
-        
+
+            # 流式写入文件，避免内存溢出
+            chunk_size = 1024 * 1024  # 1MB chunks
+            total_size = 0
+            upload_start = time.time()
+
+            print(f"开始流式接收文件: {file.filename}")
+
+            async for chunk in file.chunks(chunk_size):
+                temp_file.write(chunk)
+                total_size += len(chunk)
+
+                # 每10MB输出一次进度
+                if total_size % (10 * 1024 * 1024) == 0:
+                    print(f"已接收: {total_size / (1024*1024):.1f}MB")
+
+            upload_time = time.time() - upload_start
+            print(f"✅ 文件接收完成！大小: {total_size/(1024*1024):.2f}MB, 耗时: {upload_time:.2f}秒, 速度: {total_size/(upload_time*1024*1024):.2f}MB/s")
+
         # Add task to queue
         task_id = str(uuid.uuid4())
         future = asyncio.Future()
         task_queue.append((task_id, temp_file_path, language, future))
         print(f"Task {task_id} added to queue. Queue size: {len(task_queue)}")
-        
+
         # Process queue if not already processing
         asyncio.create_task(process_queue())
-        
+
         # Wait for task completion
         result = await future
         return result
-        
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
-    
+        error_msg = f"Processing error: {str(e)}"
+        print(f"❌ 文件处理失败: {error_msg}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
     finally:
         # Clean up temporary file
         cleanup_start = time.time()
