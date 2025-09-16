@@ -5,11 +5,107 @@
 # Exit on any error
 set -e
 
+# Function to check and handle existing processes
+check_existing_processes() {
+    echo "🔍 Checking for existing faster-whisper processes..."
+
+    # Find running processes related to faster-whisper
+    local running_processes=""
+    local ports_in_use=""
+
+    # Check for Python processes running our services
+    if pgrep -f "python.*faster_whisper_api" > /dev/null 2>&1; then
+        running_processes="faster_whisper_api"
+    fi
+
+    if pgrep -f "python.*load_balancer" > /dev/null 2>&1; then
+        if [[ -n "$running_processes" ]]; then
+            running_processes="${running_processes}, "
+        fi
+        running_processes="${running_processes}load_balancer"
+    fi
+
+    # Check for occupied ports
+    for port in {5001..5010}; do
+        if lsof -i :$port >/dev/null 2>&1; then
+            if [[ -n "$ports_in_use" ]]; then
+                ports_in_use="${ports_in_use}, "
+            fi
+            ports_in_use="${ports_in_use}port_$port"
+        fi
+    done
+
+    # If processes are running, ask user what to do
+    if [[ -n "$running_processes" ]] || [[ -n "$ports_in_use" ]]; then
+        echo "⚠️  Found running processes related to faster-whisper:"
+        if [[ -n "$running_processes" ]]; then
+            echo "   Running services: $running_processes"
+        fi
+        if [[ -n "$ports_in_use" ]]; then
+            echo "   Occupied ports: $ports_in_use"
+        fi
+        echo ""
+
+        while true; do
+            read -p "Do you want to kill these processes and continue with new services? (y/n): " -n 1 -r user_choice
+            echo
+            case $user_choice in
+                [Yy])
+                    echo "🧹 Killing existing processes..."
+
+                    # Kill faster_whisper_api processes
+                    if pgrep -f "python.*faster_whisper_api" > /dev/null 2>&1; then
+                        pkill -f "python.*faster_whisper_api"
+                        echo "✅ Killed faster_whisper_api processes"
+                    fi
+
+                    # Kill load_balancer processes
+                    if pgrep -f "python.*load_balancer" > /dev/null 2>&1; then
+                        pkill -f "python.*load_balancer"
+                        echo "✅ Killed load_balancer processes"
+                    fi
+
+                    # Wait a moment for processes to fully terminate
+                    sleep 3
+
+                    # Double-check and force kill if needed
+                    if pgrep -f "python.*faster_whisper_api" > /dev/null 2>&1; then
+                        pkill -9 -f "python.*faster_whisper_api"
+                        echo "⚠️  Force killed remaining faster_whisper_api processes"
+                    fi
+
+                    if pgrep -f "python.*load_balancer" > /dev/null 2>&1; then
+                        pkill -9 -f "python.*load_balancer"
+                        echo "⚠️  Force killed remaining load_balancer processes"
+                    fi
+
+                    echo "✅ All existing processes killed"
+                    echo ""
+                    return
+                    ;;
+                [Nn])
+                    echo "ℹ️  User chose to exit. Keeping existing processes running."
+                    exit 0
+                    ;;
+                *)
+                    echo "❌ Invalid choice. Please enter 'y' or 'n'."
+                    ;;
+            esac
+        done
+    else
+        echo "✅ No existing faster-whisper processes found"
+        echo ""
+    fi
+}
+
 # Activate virtual environment
 source faster-whisper-env/bin/activate
 
 # Set LD_LIBRARY_PATH for CUDA
 export LD_LIBRARY_PATH=$(python3 -c "import nvidia.cublas.lib; import nvidia.cudnn.lib; print(nvidia.cublas.lib.__path__[0] + ':' + nvidia.cudnn.lib.__path__[0])")
+
+# Check and handle existing processes
+check_existing_processes
 
 # Function to clean up processes on exit
 cleanup() {

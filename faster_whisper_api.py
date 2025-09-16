@@ -9,8 +9,9 @@ import tempfile
 import uuid
 import time
 from typing import Optional, List, Tuple
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 import uvicorn
 from faster_whisper import WhisperModel
 import re
@@ -23,8 +24,26 @@ import pydub
 from pydub import AudioSegment
 import numpy as np
 
-# Initialize FastAPI app with larger client size limit
-app = FastAPI(title="faster-whisper ASR Service", version="1.0.0", client_max_size=500*1024*1024)  # 500MB limit
+# Simplified middleware - only add necessary headers without touching response body
+class SimpleResponseMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        # Only update headers, don't modify response body
+        if hasattr(response, 'headers'):
+            response.headers["Connection"] = "keep-alive"
+
+        return response
+
+# Initialize FastAPI app with larger client size limit and response handling
+app = FastAPI(
+    title="faster-whisper ASR Service",
+    version="1.0.0",
+    client_max_size=500*1024*1024,  # 500MB limit
+)
+
+# Add middleware
+app.add_middleware(SimpleResponseMiddleware)
 
 # Global model instance
 model = None
@@ -228,7 +247,17 @@ def merge_srt_results(srt_results: List[str], chunk_durations: List[float]) -> s
         if i < len(chunk_durations):
             time_offset += chunk_durations[i]
     
-    return '\n'.join(merged_lines)
+    # Clean the merged content to ensure no BOM or invalid characters
+    merged_content = '\n'.join(merged_lines)
+
+    # Remove BOM if present
+    if merged_content.startswith('\ufeff'):
+        merged_content = merged_content[1:]
+
+    # Strip any extra whitespace
+    merged_content = merged_content.strip()
+
+    return merged_content
 
 
 def adjust_srt_timestamp(timestamp: str, offset_seconds: float) -> str:
@@ -454,12 +483,20 @@ def transcribe_to_srt(file_path: str, language: str = "auto", max_words_per_segm
             print(f"Debug Info - SRT Generation: {srt_generation_time:.2f}s")
             print(f"Debug Info - Segments: {segment_index-1}, Words: {total_words}")
             
+            # Clean SRT content to remove BOM and invalid characters
+            final_srt = srt_content.strip()
+            if final_srt.startswith('\ufeff'):
+                print("Debug Info - Found BOM in SRT content from transcribe_to_srt, removing...")
+                final_srt = final_srt[1:]
+
             # Debug return timing
             return_start = time.time()
-            result = srt_content.strip()
+            result = final_srt
             return_time = time.time() - return_start
             print(f"Debug Info - Function return preparation time: {return_time:.6f}s")
-            
+
+            print(f"DEBUG: Final SRT content preview: {repr(result[:100])}")
+
             return result
             
         except TimeoutError as e:
@@ -488,6 +525,16 @@ async def startup_event():
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy"}
+
+@app.get("/test-json")
+async def test_json_response():
+    """Test endpoint to verify JSON response format"""
+    test_data = "1\n00:00:00,000 --> 00:00:02,000\n测试字幕内容\n\n2\n00:00:02,000 --> 00:00:04,000\n第二条字幕"
+    return {
+        "code": 0,
+        "msg": "ok",
+        "data": test_data
+    }
 
 @app.post("/inference")
 async def inference(
@@ -519,7 +566,11 @@ async def inference(
 
             print(f"开始流式接收文件: {file.filename}")
 
-            async for chunk in file.chunks(chunk_size):
+            # 使用正确的FastAPI上传文件读取方法
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
                 temp_file.write(chunk)
                 total_size += len(chunk)
 
@@ -607,9 +658,19 @@ async def process_queue():
                     chunk_time = time.time() - chunk_start
                     print(f"Chunk {i+1} processed in {chunk_time:.2f}s")
                 
-                # Merge SRT results with adjusted timestamps
+                # Merge SRT results with adjusted timestamps using proper SRTMerger
                 print("Merging SRT results from chunks...")
-                final_srt = merge_srt_results(srt_results, chunk_durations)
+                from srt_merger import SRTMerger
+
+                # Create timing information for chunks
+                chunk_timings = []
+                current_time = 0.0
+                for duration in chunk_durations:
+                    chunk_timings.append((current_time, current_time + duration))
+                    current_time += duration
+
+                merger = SRTMerger()
+                final_srt = merger.merge_chunk_results(srt_results, chunk_timings)
                 srt_content = final_srt
                 
                 # Clean up chunk files
@@ -637,25 +698,127 @@ async def process_queue():
         srt_length = len(srt_content)
         print(f"Debug Info - SRT content length: {srt_length} characters")
         
-        # Create response
+        # Create response with proper headers for large files
         response_start = time.time()
-        response = JSONResponse(content={
+
+        # Clean SRT content to ensure valid JSON - debug and handle BOM/Unicode issues
+        print(f"DEBUG: Raw SRT content type: {type(srt_content)}")
+        print(f"DEBUG: SRT content byte representation: {repr(srt_content[:100].encode('utf-8') if isinstance(srt_content, str) else srt_content[:100])}")
+
+        # Check for BOM (Byte Order Mark) which can cause JSON parsing errors
+        if isinstance(srt_content, str):
+            cleaned_srt = srt_content
+            bom_utf8 = '\ufeff'
+            bom_utf8_bytes = b'\xef\xbb\xbf'
+        else:
+            # Handle bytes case
+            cleaned_srt = srt_content.decode('utf-8', errors='ignore') if isinstance(srt_content, bytes) else str(srt_content)
+
+        # Remove UTF-8 BOM if present (after conversion to string)
+        if isinstance(cleaned_srt, str) and cleaned_srt.startswith(bom_utf8):
+            print("DEBUG: Found UTF-8 BOM in SRT content, removing...")
+            cleaned_srt = cleaned_srt[1:]
+
+        # Strip whitespace and newlines
+        cleaned_srt = cleaned_srt.strip()
+        if cleaned_srt.startswith('\n'):
+            cleaned_srt = cleaned_srt[1:]  # Remove leading newline
+        if cleaned_srt.startswith('\r\n'):
+            cleaned_srt = cleaned_srt[2:]  # Remove leading CRLF
+
+        print(f"DEBUG: Cleaned SRT content preview: {repr(cleaned_srt[:100])}")
+
+        # Final JSON validation check
+        import json
+        json_response = json.dumps({
             "code": 0,
             "msg": "ok",
-            "data": srt_content
+            "data": cleaned_srt
+        }, ensure_ascii=False)
+
+        # Check for any invisible characters at the start
+        json_repr = repr(json_response[:100])
+        print(f"DEBUG: Final JSON preview (repr): {json_repr}")
+
+        # Check if JSON starts correctly
+        if not json_response.startswith('{'):
+            print(f"WARN: JSON doesn't start with '{{', actual start: {repr(json_response[:50])}")
+
+        # Create proper JSON response with explicit content type
+        # Create JSON response manually to ensure proper formatting
+        import json
+
+        json_data = {
+            "code": 0,
+            "msg": "ok",
+            "data": cleaned_srt
+        }
+
+        json_string = json.dumps(json_data, ensure_ascii=False)
+        print(f"DEBUG: Final JSON string preview: {json_string[:100]}...")
+
+        response = JSONResponse(
+            content=json_data,
+            headers={
+                "Content-Type": "application/json; charset=utf-8"
+            },
+            status_code=200
+        )
+
+        # CRITICAL: Force Content-Type override using multiple methods
+        response.headers.update({"Content-Type": "application/json; charset=utf-8"})
+        response.media_type = "application/json"
+
+        # Add debug headers for client inspection
+        response.headers.update({
+            "X-Debug-Response-Type": "json",
+            "X-Debug-Content-Length": str(len(json_string)),
+            "X-Debug-Process": "faster_whisper_api"
         })
+
+        # FINAL SAFEGUARD: Force response class recreation to ensure proper JSON format
+        response = JSONResponse(
+            content=json_data,
+            status_code=200,
+            media_type="application/json",
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "X-Debug-Response-Type": "json",
+                "X-Debug-Content-Length": str(len(json_string)),
+                "X-Debug-Process": "faster_whisper_api"
+            }
+        )
+
+        print("=== CRITICAL DEBUG ===")
+        print(f"DEBUG: Final JSON: {json_string[:200]}...")
+        print(f"DEBUG: Response Content-Type: {response.headers.get('content-type')}")
+        print(f"DEBUG: Response media_type: {response.media_type}")
+        print(f"DEBUG: All response headers: {dict(response.headers)}")
+
+        # Final verification - check response body format
+        response_body = response.body
+        print(f"DEBUG: Response body starts with: {response_body[:20]}")
+        print(f"DEBUG: Response body type: {type(response_body)}")
+        print("=== END CRITICAL DEBUG ===")
         response_time = time.time() - response_start
         print(f"Debug Info - JSON response creation time: {response_time:.6f}s")
-        
+
         # Set the result
         future.set_result(response)
         
     except Exception as e:
-        error_response = JSONResponse(content={
-            "code": 500,
-            "msg": f"Processing error: {str(e)}",
-            "data": ""
-        })
+        print(f"ERROR: Exception in inference: {str(e)}")
+        import traceback
+        print(f"ERROR: Traceback: {traceback.format_exc()}")
+
+        error_response = JSONResponse(
+            content={
+                "code": 500,
+                "msg": f"Processing error: {str(e)}",
+                "data": ""
+            },
+            headers={"Content-Type": "application/json; charset=utf-8"}
+        )
         future.set_result(error_response)
     
     finally:

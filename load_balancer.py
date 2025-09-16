@@ -7,7 +7,7 @@ Distributes requests across multiple GPU instances
 import os
 import asyncio
 import aiohttp
-from aiohttp import web, ClientSession, MultipartReader
+from aiohttp import web, ClientSession
 import json
 from typing import List, Dict, Optional, Tuple, Any
 import logging
@@ -15,10 +15,67 @@ from collections import deque
 import uuid
 from dataclasses import dataclass
 from concurrent.futures import TimeoutError
+import subprocess
+import tempfile
+import re
+
+# Import distributed processing components
+from distributed_processor import DistributedProcessor
+
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+async def parse_multipart_data(data: bytes, boundary: str) -> bytes:
+    """Parse multipart data and extract audio file content"""
+    try:
+        # Convert boundary to bytes with proper formatting
+        boundary_bytes = f"--{boundary}".encode('utf-8')
+        end_boundary_bytes = f"--{boundary}--".encode('utf-8')
+
+        # Find the start of the audio data (after headers)
+        # Look for the boundary, then skip headers until we find the empty line
+        start_idx = 0
+        while start_idx < len(data):
+            # Find next boundary
+            boundary_idx = data.find(boundary_bytes, start_idx)
+            if boundary_idx == -1:
+                logger.error("Could not find starting boundary in multipart data")
+                raise ValueError("Could not find starting boundary in multipart data")
+
+            # Find the end of headers (double newline)
+            header_end_idx = data.find(b'\r\n\r\n', boundary_idx)
+            if header_end_idx == -1:
+                # Try with just \n\n
+                header_end_idx = data.find(b'\n\n', boundary_idx)
+                if header_end_idx == -1:
+                    start_idx = boundary_idx + len(boundary_bytes)
+                    continue
+
+            # Extract content between headers and next boundary
+            content_start = header_end_idx + 4 if data[header_end_idx:header_end_idx+4] == b'\r\n\r\n' else header_end_idx + 2
+            content_end = data.find(boundary_bytes, content_start)
+
+            # If we found another boundary, this is our content
+            if content_end != -1:
+                # Check if this section contains the audio file
+                # Look for filename in the headers part
+                header_part = data[boundary_idx:header_end_idx].decode('utf-8', errors='ignore')
+                if 'filename=' in header_part or 'name="audio"' in header_part:
+                    # This is the audio content
+                    return data[content_start:content_end].strip()
+
+            start_idx = header_end_idx + 4
+
+        logger.error("No audio file found in multipart data")
+        raise ValueError("No audio file found in multipart data")
+
+    except Exception as e:
+        logger.error(f"Error parsing multipart data: {e}")
+        raise
 
 # Load backend services from environment variables
 BACKEND_SERVICES = os.getenv("BACKEND_SERVICES", "http://localhost:5002,http://localhost:5003,http://localhost:5004,http://localhost:5005").split(",") 
@@ -47,6 +104,83 @@ REQUEST_QUEUE = deque(maxlen=MAX_QUEUE_SIZE)  # Queue for pending requests
 ACTIVE_REQUESTS = {}  # Track active requests by backend
 current_index = 0  # For round-robin distribution
 queue_processor_task = None  # Background task for processing queue
+
+# Initialize distributed processor
+distributed_processor = DistributedProcessor()
+
+def check_audio_format(file_data: bytes) -> Dict[str, Any]:
+    """
+    Use ffprobe to check audio file format and duration
+
+    Args:
+        file_data: Audio file data as bytes
+
+    Returns:
+        Dictionary with format information
+    """
+    try:
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.tmp') as temp_file:
+            temp_file.write(file_data)
+            temp_file_path = temp_file.name
+
+        try:
+            # Run ffprobe to get format information
+            cmd = [
+                'ffprobe',
+                '-v', 'quiet',
+                '-print_format', 'json',
+                '-show_format',
+                '-show_streams',
+                temp_file_path
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+            if result.returncode != 0:
+                logger.error(f"ffprobe failed: {result.stderr}")
+                return {"error": result.stderr}
+
+            # Parse JSON output
+            probe_data = json.loads(result.stdout)
+
+            # Extract relevant information
+            format_info = {
+                "format": probe_data.get("format", {}).get("format_name", "unknown"),
+                "duration": float(probe_data.get("format", {}).get("duration", 0)),
+                "size": int(probe_data.get("format", {}).get("size", 0)),
+                "bit_rate": int(probe_data.get("format", {}).get("bit_rate", 0)),
+                "streams": []
+            }
+
+            # Extract stream information
+            for stream in probe_data.get("streams", []):
+                if stream.get("codec_type") == "audio":
+                    stream_info = {
+                        "codec": stream.get("codec_name", "unknown"),
+                        "sample_rate": stream.get("sample_rate", "unknown"),
+                        "channels": stream.get("channels", "unknown"),
+                        "duration": float(stream.get("duration", 0))
+                    }
+                    format_info["streams"].append(stream_info)
+
+            logger.info(f"Audio format check: {format_info}")
+            return format_info
+
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+
+    except subprocess.TimeoutError:
+        logger.error("ffprobe timeout")
+        return {"error": "ffprobe timeout"}
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse ffprobe output: {e}")
+        return {"error": f"JSON parse error: {e}"}
+    except Exception as e:
+        logger.error(f"Error checking audio format: {e}")
+        return {"error": str(e)}
 
 async def health_check_task():
     """Periodically check health of backend services"""
@@ -322,8 +456,8 @@ async def inference_handler(request):
         logger.info(f"Request headers: {dict(request.headers)}")
         logger.info(f"Request content length: {request.content_length}")
         logger.info(f"Request content type: {request.headers.get('Content-Type')}")
-        
-        # Read request body once - 简化版本，避免复杂的流式处理
+
+        # Read request body once
         try:
             # 检查是否是multipart/form-data上传
             content_type = request.headers.get('Content-Type', '')
@@ -363,76 +497,198 @@ async def inference_handler(request):
             logger.error(f"请求体处理失败: {e}")
             raise web.HTTPInternalServerError(reason=f"Request processing failed: {e}")
 
+        # Extract actual audio file from multipart data
+        audio_data = request_body
+        if 'multipart/form-data' in content_type:
+            # Parse multipart to extract the audio file
+            try:
+                logger.info("Parsing multipart data to extract audio file...")
+
+                # Use the already read request_body to manually parse multipart data
+                # Extract boundary from Content-Type header
+                import re
+                boundary_match = re.search(r'boundary=(.+)', content_type)
+                if not boundary_match:
+                    logger.error("No boundary found in Content-Type header")
+                    raise web.HTTPBadRequest(reason="No boundary found in Content-Type header")
+
+                boundary = boundary_match.group(1)
+                logger.info(f"Found boundary: {boundary}")
+
+                # Parse multipart data manually
+                audio_data = await parse_multipart_data(request_body, boundary)
+                logger.info(f"Extracted audio file: {len(audio_data)} bytes")
+
+            except Exception as e:
+                logger.error(f"Failed to parse multipart data: {e}")
+                raise web.HTTPBadRequest(reason=f"Failed to parse multipart data: {e}")
+
+        # Check audio format using ffprobe
+        logger.info("Checking audio format with ffprobe...")
+        format_info = check_audio_format(audio_data)
+
+        if "error" in format_info:
+            logger.error(f"Audio format check failed: {format_info['error']}")
+            raise web.HTTPBadRequest(reason=f"Invalid audio format: {format_info['error']}")
+
+        # Log audio format information
+        audio_format = format_info.get("format", "unknown")
+        audio_duration = format_info.get("duration", 0)
+        audio_bitrate = format_info.get("bit_rate", 0)
+
+        logger.info(f"Audio format: {audio_format}, Duration: {audio_duration:.2f}s, Bitrate: {audio_bitrate}bps")
+
+        # Validate audio format
+        supported_formats = ["wav", "mp3", "flac", "aac", "ogg", "m4a", "wma"]
+        if audio_format not in supported_formats and "unknown" not in audio_format:
+            logger.warning(f"Unsupported audio format: {audio_format}")
+            # We'll try to process it anyway, as ffmpeg might handle it
+
         # Check if there are any healthy backends
         healthy_backends = get_healthy_backends()
         if not healthy_backends:
             logger.error("No healthy backends available")
             raise web.HTTPServiceUnavailable(reason="No healthy backend services available")
 
-        # Calculate progressive timeout based on file size
-        timeout = calculate_request_timeout(len(request_body))
-        logger.info(f"Using progressive timeout of {timeout}s for request {request_id}")
-        
-        # Try to get an idle backend immediately
-        backend = get_idle_backend()
-        if backend:
-            logger.info(f"Found idle backend {backend}, processing immediately")
-            try:
-                # Mark backend as busy
-                BACKEND_BUSY[backend] = True
-                
-                # Process request immediately
-                result = await asyncio.wait_for(
-                    process_request_on_backend(backend, request, request_body),
-                    timeout=timeout
-                )
-                BACKEND_BUSY[backend] = False
-                logger.info(f"Request {request_id} completed immediately on backend {backend}")
-                return result
-            except asyncio.TimeoutError:
-                logger.error(f"Request {request_id} timed out on backend {backend}")
-                BACKEND_BUSY[backend] = False
-                raise web.HTTPGatewayTimeout(reason=f"Request timed out on backend {backend}")
-            except Exception as e:
-                logger.error(f"Error processing request {request_id} immediately: {e}")
-                BACKEND_BUSY[backend] = False
-                # Fall back to queue
-                logger.info(f"Falling back to queue for request {request_id}")
-        
-        # No idle backend available, add to queue
-        logger.info(f"No idle backend available, queueing request {request_id}")
-        try:
-            future = await add_request_to_queue(request, request_body)
-            logger.info(f"Waiting for queued request {request_id} to be processed")
-            
-            # Wait for the result with progressive timeout
-            result = await asyncio.wait_for(future, timeout=timeout)
-            logger.info(f"Queued request {request_id} completed successfully")
-            return result
-            
-        except asyncio.TimeoutError:
-            logger.error(f"Queued request {request_id} timed out")
-            raise web.HTTPGatewayTimeout(reason="Request timed out in queue")
-        except Exception as e:
-            logger.error(f"Error with queued request {request_id}: {e}")
-            if isinstance(e, web.HTTPException):
-                raise
-            raise web.HTTPInternalServerError(reason=f"Error processing queued request: {str(e)}")
-                
+        # Get available backends
+        available_backends = get_available_backends()
+        logger.info(f"Available backends: {len(available_backends)}/{len(healthy_backends)}")
+
+        # Check if we should use distributed processing
+        should_use_distributed = await distributed_processor.should_distribute(
+            len(audio_data), len(available_backends)
+        )
+
+        if should_use_distributed and len(available_backends) > 1:
+            logger.info(f"Using distributed processing for request {request_id}")
+            return await process_distributed_request(request, request_body, available_backends, content_type)
+        else:
+            logger.info(f"Using single worker processing for request {request_id}")
+            return await process_single_worker_request(request, request_body, available_backends)
+
     except web.HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
         raise web.HTTPInternalServerError(reason=f"Error processing request: {str(e)}")
 
+async def process_distributed_request(request, request_body: bytes, available_backends: List[str], content_type: str):
+    """Process request using distributed workers"""
+    request_id = str(uuid.uuid4())
+    timeout = calculate_request_timeout(len(request_body))
+
+    logger.info(f"Processing distributed request {request_id} with {len(available_backends)} workers")
+    logger.info(f"Using timeout of {timeout}s")
+
+    # Create session with timeout
+    timeout_obj = aiohttp.ClientTimeout(
+        total=timeout,
+        connect=30,
+        sock_connect=30,
+        sock_read=timeout
+    )
+
+    try:
+        async with ClientSession(timeout=timeout_obj) as session:
+            # Prepare headers
+            headers = {}
+            for key, value in request.headers.items():
+                if key.lower() not in ['content-length', 'host']:
+                    headers[key] = value
+
+            # Process distributed
+            result = await asyncio.wait_for(
+                distributed_processor.process_distributed(
+                    request_body, available_backends, session, headers
+                ),
+                timeout=timeout
+            )
+
+            # Debug: check result
+            logger.info(f"DEBUG: Distributed result length: {len(result) if result else 'None/Empty'}")
+            if not result or len(result.strip()) == 0:
+                logger.warning("WARNING: Empty SRT result returned from distributed processing!")
+                raise web.HTTPInternalServerError(reason="Distributed processing returned empty SRT")
+
+            logger.info(f"Distributed request {request_id} completed successfully")
+
+            # Return JSON response like individual workers do
+            return web.json_response({
+                "code": 0,
+                "msg": "ok",
+                "data": result
+            })
+
+    except asyncio.TimeoutError:
+        logger.error(f"Distributed request {request_id} timed out")
+        raise web.HTTPGatewayTimeout(reason="Distributed processing timed out")
+    except Exception as e:
+        logger.error(f"Error in distributed processing for request {request_id}: {e}")
+        raise web.HTTPInternalServerError(reason=f"Distributed processing failed: {str(e)}")
+
+async def process_single_worker_request(request, request_body: bytes, available_backends: List[str]):
+    """Process request using single worker (original logic)"""
+    request_id = str(uuid.uuid4())
+    timeout = calculate_request_timeout(len(request_body))
+    logger.info(f"Using timeout of {timeout}s for request {request_id}")
+
+    # Try to get an idle backend immediately
+    backend = get_idle_backend()
+    if backend:
+        logger.info(f"Found idle backend {backend}, processing immediately")
+        try:
+            # Mark backend as busy
+            BACKEND_BUSY[backend] = True
+
+            # Process request immediately
+            result = await asyncio.wait_for(
+                process_request_on_backend(backend, request, request_body),
+                timeout=timeout
+            )
+            BACKEND_BUSY[backend] = False
+            logger.info(f"Request {request_id} completed immediately on backend {backend}")
+            return result
+        except asyncio.TimeoutError:
+            logger.error(f"Request {request_id} timed out on backend {backend}")
+            BACKEND_BUSY[backend] = False
+            raise web.HTTPGatewayTimeout(reason=f"Request timed out on backend {backend}")
+        except Exception as e:
+            logger.error(f"Error processing request {request_id} immediately: {e}")
+            BACKEND_BUSY[backend] = False
+            # Fall back to queue
+            logger.info(f"Falling back to queue for request {request_id}")
+
+    # No idle backend available, add to queue
+    logger.info(f"No idle backend available, queueing request {request_id}")
+    try:
+        future = await add_request_to_queue(request, request_body)
+        logger.info(f"Waiting for queued request {request_id} to be processed")
+
+        # Wait for the result with progressive timeout
+        result = await asyncio.wait_for(future, timeout=timeout)
+        logger.info(f"Queued request {request_id} completed successfully")
+        return result
+
+    except asyncio.TimeoutError:
+        logger.error(f"Queued request {request_id} timed out")
+        raise web.HTTPGatewayTimeout(reason="Request timed out in queue")
+    except Exception as e:
+        logger.error(f"Error with queued request {request_id}: {e}")
+        if isinstance(e, web.HTTPException):
+            raise
+        raise web.HTTPInternalServerError(reason=f"Error processing queued request: {str(e)}")
+
 async def health_handler(request):
     """Health check endpoint"""
     healthy_backends = get_healthy_backends()
     available_backends = [
-        service for service in BACKEND_STATUS.items() 
+        service for service in BACKEND_STATUS.items()
         if service[1] and not BACKEND_BUSY.get(service[0], False)
     ]
-    
+
+    # Get distributed processing stats
+    distributed_stats = distributed_processor.get_processing_stats()
+
     status = {
         "status": "healthy" if healthy_backends else "degraded",
         "healthy_backends": len(healthy_backends),
@@ -440,6 +696,7 @@ async def health_handler(request):
         "total_backends": len(BACKEND_SERVICES),
         "queue_length": len(REQUEST_QUEUE),
         "max_queue_size": MAX_QUEUE_SIZE,
+        "distributed_processing": distributed_stats,
         "backends": {
             service: {
                 "healthy": BACKEND_STATUS[service],
