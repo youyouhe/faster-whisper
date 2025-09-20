@@ -23,7 +23,7 @@ import logging
 import shutil
 
 # Import database components
-from load_balancer import TusDatabase
+from tus_database import TusDatabase
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

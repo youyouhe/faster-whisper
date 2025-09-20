@@ -33,7 +33,7 @@ class CallbackAttempt:
 class CallbackService:
     """Service for handling HTTP callbacks"""
 
-    def __init__(self, redis_url: str = "redis://localhost:6379"):
+    def __init__(self, redis_url: str = "redis://redis:6379"):
         self.redis_url = redis_url
         self.message_queue = get_message_queue(redis_url)
         self.task_manager = get_task_manager()
@@ -249,7 +249,7 @@ async def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
 
     logger.info("Starting Callback Service")
     logger.info(f"Redis URL: {redis_url}")

@@ -7,8 +7,12 @@ base_dir = os.path.dirname(os.path.abspath(__file__))
 
 def get_long_description():
     readme_path = os.path.join(base_dir, "README.md")
-    with open(readme_path, encoding="utf-8") as readme_file:
-        return readme_file.read()
+    try:
+        with open(readme_path, encoding="utf-8") as readme_file:
+            return readme_file.read()
+    except FileNotFoundError:
+        # Return a default description if README.md is not found
+        return "Faster Whisper transcription with CTranslate2"
 
 
 def get_project_version():

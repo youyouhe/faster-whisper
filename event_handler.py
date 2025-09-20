@@ -12,12 +12,11 @@ from typing import Dict, Any
 # Import components
 from message_queue import get_message_queue, QueueMessage
 from task_model import get_task_manager
-from tus_api_server import callback_handler
 
 logger = logging.getLogger(__name__)
 
 # Configuration
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
 

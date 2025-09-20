@@ -1,44 +1,28 @@
-FROM python:3.10-slim
+FROM dockerproxy.com/library/python:3.10-alpine
+
+# Install minimal runtime dependencies
+RUN apk add --no-cache \
+    curl \
+    bzip2-dev \
+    xz-dev \
+    && pip install --no-cache-dir --upgrade pip
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Install exact TUS server dependencies
+RUN pip install --no-cache-dir \
+    aiohttp \
+    redis
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy required files
+COPY tus_server.py task_model.py message_queue.py tus_database.py ./
 
-# Copy application code
-COPY tus_server.py ./
-COPY load_balancer.py ./
-COPY message_queue.py ./
-COPY __init__.py ./
-
-# Create directories
+# Setup
 RUN mkdir -p /data/uploads /logs
-
-# Set environment variables
-ENV PYTHONPATH=/app
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app PYTHONUNBUFFERED=1
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "
-import socket
-import sys
+    CMD curl -f http://localhost:1080/health || exit 1
 
-try:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5)
-    result = sock.connect_ex(('localhost', 1080))
-    sock.close()
-    sys.exit(0 if result == 0 else 1)
-except:
-    sys.exit(1)
-"
-
-# Run the Tus server
 CMD ["python", "tus_server.py"]

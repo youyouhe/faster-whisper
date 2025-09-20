@@ -8,6 +8,7 @@ import os
 import uuid
 from typing import Dict, Optional, Any
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, Field
@@ -29,10 +30,21 @@ TUS_SERVER_BASE_URL = os.getenv("TUS_SERVER_BASE_URL", "http://localhost:1080/fi
 CALLBACK_TIMEOUT = int(os.getenv("CALLBACK_TIMEOUT", "30"))
 API_PORT = int(os.getenv("API_PORT", "8000"))
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup event
+    logger.info("Tus.io compatible ASR API Server")
+    logger.info(f"API listening on port {API_PORT}")
+    logger.info(f"Tus server base URL: {TUS_SERVER_BASE_URL}")
+    yield
+    # Shutdown event (if needed)
+    pass
+
 app = FastAPI(
     title="Tus.io ASR API Server",
     version="1.0.0",
-    description="API server for managing ASR tasks with Tus.io resumable uploads"
+    description="API server for managing ASR tasks with Tus.io resumable uploads",
+    lifespan=lifespan
 )
 
 class TaskRequest(BaseModel):
@@ -278,13 +290,6 @@ async def root():
 
 # Callback handling is now done by the separate CallbackService
 # This API server focuses only on task creation
-
-@app.on_event("startup")
-async def startup_event():
-    """App startup event"""
-    logger.info("Tus.io compatible ASR API Server")
-    logger.info(f"API listening on port {API_PORT}")
-    logger.info(f"Tus server base URL: {TUS_SERVER_BASE_URL}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=API_PORT)

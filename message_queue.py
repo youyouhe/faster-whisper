@@ -53,7 +53,7 @@ class QueueMessage:
 class MessageQueue:
     """Redis-based message queue handler"""
 
-    def __init__(self, redis_url: str = "redis://localhost:6379"):
+    def __init__(self, redis_url: str = "redis://redis:6379"):
         """
         Initialize message queue
 
@@ -288,7 +288,7 @@ class MessageQueue:
 _message_queue_instance = None
 _message_queue_lock = threading.Lock()
 
-def get_message_queue(redis_url: str = "redis://localhost:6379") -> MessageQueue:
+def get_message_queue(redis_url: str = "redis://redis:6379") -> MessageQueue:
     """Get singleton message queue instance"""
     global _message_queue_instance
 
@@ -296,5 +296,9 @@ def get_message_queue(redis_url: str = "redis://localhost:6379") -> MessageQueue
         with _message_queue_lock:
             if _message_queue_instance is None:
                 _message_queue_instance = MessageQueue(redis_url)
+    else:
+        # If instance exists but with different URL, recreate it
+        if _message_queue_instance.redis_url != redis_url:
+            _message_queue_instance = MessageQueue(redis_url)
 
     return _message_queue_instance
