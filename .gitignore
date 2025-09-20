@@ -29,3 +29,6 @@ faster-whisper-env/
 
 # Test data
 tests/data/test.wav
+*.db
+data/uploads/*
+data/srt_results/*
