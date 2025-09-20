@@ -32,3 +32,5 @@ tests/data/test.wav
 *.db
 data/uploads/*
 data/srt_results/*
+*.bak
+docker/backup_original/
