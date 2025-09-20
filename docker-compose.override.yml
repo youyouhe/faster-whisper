@@ -1,0 +1,7 @@
+version: '3.8'
+
+services:
+  # Override for the dynamic GPU service to allow scaling
+  faster-whisper-dynamic:
+    # This allows docker-compose to scale the service
+    scale: 1
