@@ -25,12 +25,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))
 SHUTDOWN_TIMEOUT = int(os.getenv("SHUTDOWN_TIMEOUT", "30"))
 WORKER_POLL_INTERVAL = int(os.getenv("WORKER_POLL_INTERVAL", "5"))
-SRT_STORAGE_DIR = os.getenv("SRT_STORAGE_DIR", "/tmp/srt_results")
-LOAD_BALANCER_URL = os.getenv("LOAD_BALANCER_URL", "http://localhost:5001")
+SRT_STORAGE_DIR = os.getenv("SRT_STORAGE_DIR", "/data/srt_results")
+LOAD_BALANCER_URL = os.getenv("LOAD_BALANCER_URL", "http://faster-whisper-dynamic:5001")
 
 # Ensure SRT storage directory exists
 Path(SRT_STORAGE_DIR).mkdir(parents=True, exist_ok=True)
@@ -377,8 +377,8 @@ def main():
     """Main function"""
     # Configuration from environment
     num_workers = int(os.getenv("MAX_WORKERS", "3"))
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-    load_balancer_url = os.getenv("LOAD_BALANCER_URL", "http://localhost:5001")
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
+    load_balancer_url = os.getenv("LOAD_BALANCER_URL", "http://faster-whisper-dynamic:5001")
 
     logger.info("Starting ASR Worker Service")
     logger.info(f"Redis URL: {redis_url}")

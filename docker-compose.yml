@@ -23,6 +23,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - DATABASE_PATH=/data/tus_uploads.db
+      - DATA_DIR=/data
       - UPLOAD_DIR=/data/uploads
       - TUS_SERVER_BASE_URL=http://tus-server:1080/files
       - CALLBACK_TIMEOUT=30
@@ -50,6 +51,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - DATABASE_PATH=/data/tus_uploads.db
+      - DATA_DIR=/data
       - UPLOAD_DIR=/data/uploads
       - MAX_FILE_SIZE=500
       - CLEANUP_INTERVAL=3600
@@ -66,95 +68,110 @@ services:
       timeout: 10s
       retries: 3
 
-  # Event Handler - Bridges Tus server and ASR workers
-  event-handler:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.event
-    container_name: event-handler
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - POLL_INTERVAL=5
-      - MAX_RETRY_ATTEMPTS=3
-    volumes:
-      - ./logs:/logs
-    depends_on:
-      - redis
-    restart: unless-stopped
+  # # Event Handler - Bridges Tus server and ASR workers
+  # event-handler:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/Dockerfile.event
+  #   container_name: event-handler
+  #   environment:
+  #     - REDIS_URL=redis://redis:6379
+  #     - DATABASE_PATH=/data/tus_uploads.db
+  #     - DATA_DIR=/data
+  #     - POLL_INTERVAL=5
+  #     - MAX_RETRY_ATTEMPTS=3
+  #   volumes:
+  #     - ./data:/data
+  #     - ./logs:/logs
+  #   depends_on:
+  #     - redis
+  #   restart: unless-stopped
 
-  # Callback Service - Handles HTTP callbacks
-  callback-service:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.callback
-    container_name: callback-service
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - CALLBACK_MAX_ATTEMPTS=3
-      - CALLBACK_RETRY_DELAY=10
-      - CALLBACK_TIMEOUT=30
-      - CALLBACK_CONCURRENCY=10
-    volumes:
-      - ./logs:/logs
-    depends_on:
-      - redis
-    restart: unless-stopped
+  # # Callback Service - Handles HTTP callbacks
+  # callback-service:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/Dockerfile.callback
+  #   container_name: callback-service
+  #   environment:
+  #     - REDIS_URL=redis://redis:6379
+  #     - CALLBACK_MAX_ATTEMPTS=3
+  #     - CALLBACK_RETRY_DELAY=10
+  #     - CALLBACK_TIMEOUT=30
+  #     - CALLBACK_CONCURRENCY=10
+  #   volumes:
+  #     - ./logs:/logs
+  #   depends_on:
+  #     - redis
+  #   restart: unless-stopped
 
-  # ASR Worker - Processes audio files
-  asr-worker:
+  # Dynamic GPU Services with Load Balancer
+  faster-whisper-dynamic:
     build:
       context: .
-      dockerfile: docker/Dockerfile.worker
-    container_name: asr-worker
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - MAX_WORKERS=2
-      - SRT_STORAGE_DIR=/data/srt_results
-      - GPU_DEVICE_ID=0
-    volumes:
-      - ./data:/data
-      - ./logs:/logs
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=0
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    depends_on:
-      - redis
-      - event-handler
-    restart: unless-stopped
-    ports:
-      - "8081:8081"  # Health check port
-
-  # Legacy Load Balancer (kept for compatibility)
-  faster-whisper:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    container_name: faster-whisper-service
+      dockerfile: docker/Dockerfile.dynamic
+    image: faster-whisper-dynamic:latest
+    container_name: faster-whisper-dynamic
     ports:
       - "5001:5001"  # Load balancer
       - "5002:5002"  # GPU service 0
       - "5003:5003"  # GPU service 1
       - "5004:5004"  # GPU service 2
+      - "5005:5005"  # GPU service 3
+      - "5006:5006"  # GPU service 4
+      - "5007:5007"  # GPU service 5
+      - "5008:5008"  # GPU service 6
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - BACKEND_SERVICES=http://localhost:5002,http://localhost:5003,http://localhost:5004,http://localhost:5005
+      - DATABASE_PATH=/data/tus_uploads.db
+      - DATA_DIR=/data
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 3
+              count: all  # Use all available GPUs
               capabilities: [gpu]
     volumes:
       - ./models:/app/models
       - ./logs:/app/logs
+      - ./data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ASR Worker - CPU-only coordinator that delegates AI processing to load balancer
+  asr-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    image: faster-whisper-asr-worker:latest
+    container_name: faster-whisper-asr-worker
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - LOAD_BALANCER_URL=http://faster-whisper-dynamic:5001
+      - DATABASE_PATH=/data/tus_uploads.db
+      - DATA_DIR=/data
+      - SRT_STORAGE_DIR=/data/srt_results
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+      - ./data/srt_results:/data/srt_results
+    depends_on:
+      - redis
+      - faster-whisper-dynamic
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 60s
+      timeout: 30s
+      start_period: 30s
+      retries: 3
 
 # Shared volumes
 volumes:

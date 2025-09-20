@@ -1,32 +1,31 @@
-FROM python:3.10-slim
+FROM dockerproxy.com/library/python:3.10-alpine
+
+# Install minimal runtime dependencies
+RUN apk add --no-cache \
+    curl \
+    && pip install --no-cache-dir --upgrade pip
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Install exact API server dependencies
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    pydantic \
+    redis \
+    starlette \
+    aiohttp \
+    python-multipart
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt requirements.conversion.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy required files
+COPY tus_api_server.py callback_service.py task_model.py message_queue.py distributed_processor.py audio_splitter.py srt_merger.py ./
 
-# Copy application code
-COPY tus_api_server.py ./
-COPY task_model.py ./
-COPY message_queue.py ./
-COPY __init__.py ./
-
-# Create data directory
-RUN mkdir -p /data /logs
-
-# Set environment variables
-ENV PYTHONPATH=/app
-ENV PYTHONUNBUFFERED=1
+# Setup
+RUN mkdir -p /data /logs /data/srt_results
+ENV PYTHONPATH=/app PYTHONUNBUFFERED=1
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Run the API server
 CMD ["python", "tus_api_server.py"]
