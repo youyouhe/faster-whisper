@@ -1,0 +1,73 @@
+# Python virtual environments (HUGE!)
+faster-whisper-env/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.wheel
+*.egg-info/
+
+# Testing
+.pytest_cache/
+.coverage
+.tox/
+.cache/
+*.egg-info
+
+# Documentation
+docs/
+README.md
+*.md
+!docker/README.md
+
+# Development
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Data files (will be mounted via volumes) - exclude from build context
+data/
+*.wav
+*.mp3
+*.flac
+*.jfk.flac
+117*.wav      # Large test audio files in root directory
+*_chunk_*.wav # Audio chunks
+
+# Models (will be downloaded or mounted)
+models/
+*.bin
+*.safetensors
+*.pt
+*.onnx
+
+# Git
+.git/
+.gitignore
+
+# Node modules (if any)
+node_modules/
+
+# Temporary files
+tmp/
+temp/

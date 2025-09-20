@@ -1,0 +1,17 @@
+# Exclude large data files and models
+data/
+*.wav
+*.mp3
+*.flac
+tests/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.vscode/
+models/
+*.bin
+*.safetensors
+*.pt
+*.onnx
