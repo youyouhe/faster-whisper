@@ -1,0 +1,100 @@
+# ===== MULTI-STAGE BUILD - SHARED BUILDER =====
+FROM python:3.10-slim as builder
+
+# Install system build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy only requirements first for better caching
+COPY requirements.txt requirements.conversion.txt ./
+
+# Install Python dependencies in virtual environment
+RUN python -m venv /opt/venv && \
+    . /opt/venv/bin/activate && \
+    pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# ===== API SERVER (Minimal Runtime) =====
+FROM python:3.10-slim as api-server
+
+# Install only runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy minimal application code
+COPY tus_api_server.py task_model.py message_queue.py ./
+
+# Set environment and health check
+ENV PYTHONPATH=/app PYTHONUNBUFFERED=1
+RUN mkdir -p /data /logs
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["python", "tus_api_server.py"]
+
+# ===== TUS SERVER =====
+FROM api-server as tus-server
+
+COPY tus_server.py load_balancer.py ./
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:1080/health || exit 1
+
+CMD ["python", "tus_server.py"]
+
+# ===== EVENT HANDLER =====
+FROM api-server as event-handler
+
+COPY event_handler.py ./
+
+CMD ["python", "event_handler.py"]
+
+# ===== CALLBACK SERVICE =====
+FROM api-server as callback-service
+
+RUN pip install --no-cache-dir aiohttp
+
+COPY callback_service.py ./
+
+CMD ["python", "-m", "asyncio", "run", "callback_service.py"]
+
+# ===== ASR WORKER (GPU Support) =====
+FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04 as asr-worker
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv ffmpeg curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy virtual environment and install GPU libraries
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install GPU-specific libraries
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Copy ASR worker code
+COPY asr_worker.py faster_whisper_api.py task_model.py message_queue.py ./
+
+# Create directories and set environment
+RUN mkdir -p /data /logs /data/srt_results
+ENV PYTHONPATH=/app PYTHONUNBUFFERED=1
+
+# GPU-specific HEALTHCHECK
+HEALTHCHECK --interval=60s --timeout=30s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8081/health || exit 1
+
+CMD ["python", "asr_worker.py"]

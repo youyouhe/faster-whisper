@@ -1,0 +1,52 @@
+# ===== FASTER WHISPER API (GPU Inference Service) =====
+FROM dockerproxy.com/nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
+
+# Install system dependencies (including compile tools)
+RUN apt-get update -qq && apt-get install -qq --no-install-recommends \
+    python3 python3-pip python3-venv curl ffmpeg \
+    build-essential gcc g++ cmake git pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3 /usr/bin/python
+
+WORKDIR /app
+
+# Install dependencies in correct order to avoid conflicts
+RUN pip install --no-cache-dir --upgrade pip
+
+# Install PyTorch GPU first (most stable)
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install CTranslate2 (may need system packages)
+RUN pip install --no-cache-dir ctranslate2
+
+# Install remaining packages
+RUN pip install --no-cache-dir \
+    huggingface-hub \
+    tokenizers \
+    onnxruntime \
+    av \
+    faster-whisper \
+    fastapi \
+    uvicorn \
+    pydantic \
+    pydub \
+    numpy \
+    tqdm \
+    aiohttp \
+    python-multipart
+
+# Copy only the GPU inference service
+COPY faster_whisper_api.py task_model.py message_queue.py distributed_processor.py audio_splitter.py srt_merger.py ./
+
+# Setup
+RUN mkdir -p /data /logs
+ENV PYTHONPATH=/app PYTHONUNBUFFERED=1 NVIDIA_VISIBLE_DEVICES=all
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5001/health || exit 1
+
+# Expose default port for load balancer
+EXPOSE 5001
+
+CMD ["python", "faster_whisper_api.py"]
