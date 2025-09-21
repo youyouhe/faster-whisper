@@ -17,3 +17,6 @@ torch>=1.10.0
 
 # Audio processing dependencies
 scipy>=1.7.0
+
+#redis
+redis
