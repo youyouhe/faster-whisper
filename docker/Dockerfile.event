@@ -1,4 +1,4 @@
-FROM dockerproxy.com/library/python:3.10-alpine
+FROM python:3.10-alpine
 
 # Install minimal runtime dependencies
 RUN pip install --no-cache-dir --upgrade pip

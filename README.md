@@ -464,3 +464,88 @@ The system uses a **distributed processing architecture** designed for high-perf
 - **Large Files (>20MB)**: Auto-chunked with progress tracking
 - **Concurrent Users**: Distributed across available GPU instances
 - **Error Recovery**: Chunk-level retry on failure
+
+## Ubuntu Server Setup and Deployment
+
+### Prerequisites
+
+For a fresh Ubuntu 22.04 server, follow these steps to prepare the environment:
+
+```bash
+# Update system packages
+sudo apt update && sudo apt upgrade -y
+
+# Install Docker and Docker Compose
+sudo apt install docker.io docker-compose -y
+
+# Install FFmpeg for audio processing
+sudo apt install ffmpeg -y
+
+# Install NVIDIA drivers (if using GPU)
+sudo apt install nvidia-utils-<version> -y  # Replace <version> with your driver version
+nvidia-smi  # Verify NVIDIA drivers are working
+
+# Install Python virtual environment
+sudo apt install python3-venv -y
+```
+
+### Environment Setup
+
+```bash
+# Create and activate a Python virtual environment
+python3 -m venv faster-whisper-env
+source faster-whisper-env/bin/activate
+
+# Install the package in development mode
+pip install -e .
+```
+
+### Hosts Configuration
+
+Add the following entries to your `/etc/hosts` file:
+```
+127.0.0.1 redis
+127.0.0.1 faster-whisper-dynamic
+```
+
+### Starting Services
+
+The system consists of multiple components that work together to provide transcription services with TUS protocol support:
+
+1. **ASR Services** - Audio Speech Recognition services that perform the actual transcription:
+   ```bash
+   # Start all ASR services using the optimized script (supports multiple GPUs)
+   ./start_all_services_optimized.sh
+   ```
+
+2. **TUS Support Applications** - Applications that provide TUS protocol support for resumable file uploads:
+   ```bash
+   # Start TUS server for handling resumable uploads
+   python tus_server.py &
+
+   # Start TUS API server for task management
+   python tus_api_server.py &
+
+   # Start ASR worker for coordinating tasks between TUS and ASR services
+   python asr_worker.py &
+   ```
+
+Note: While Docker Compose configuration is provided, the main applications are typically started manually as shown above. Docker deployment is still under testing.
+
+### Testing the Setup
+
+After starting the services, you can test the transcription functionality:
+
+**Direct submission test:**
+```bash
+curl 127.0.0.1:5001/inference \
+  -H "Content-Type: multipart/form-data" \
+  -F file="@money.wav" \
+  -F response_format="srt" \
+  -F language="auto"
+```
+
+**TUS protocol submission test:**
+```bash
+python tus_client.py money.wav --output result.srt
+```

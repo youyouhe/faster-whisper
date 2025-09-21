@@ -1,5 +1,5 @@
 # ===== FASTER WHISPER API (GPU Inference Service) =====
-FROM dockerproxy.com/nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
+FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
 
 # Install system dependencies (including compile tools)
 RUN apt-get update -qq && apt-get install -qq --no-install-recommends \
