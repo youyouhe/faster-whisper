@@ -182,17 +182,27 @@ class MessageQueue:
 
     def _publish(self, queue_name: str, message: QueueMessage) -> bool:
         """Publish message to queue"""
+        logger.info(f"Publishing {message.message_type} message to {queue_name}: {message.task_id}")
+        logger.debug(f"Message data: {message.data}")
+
         try:
             message_json = json.dumps(message.to_dict())
-            self.redis_client.lpush(queue_name, message_json)
+            logger.debug(f"Serialized message JSON: {message_json}")
+
+            logger.info(f"Pushing message to queue {queue_name}")
+            result = self.redis_client.lpush(queue_name, message_json)
+            logger.info(f"Pushed message to queue {queue_name}, result: {result}")
 
             # Also publish to pub/sub for immediate notification
-            self.redis_client.publish(queue_name, message_json)
+            logger.info(f"Publishing message to pub/sub channel {queue_name}")
+            pubsub_result = self.redis_client.publish(queue_name, message_json)
+            logger.info(f"Published message to pub/sub channel {queue_name}, subscribers notified: {pubsub_result}")
 
             logger.info(f"Published {message.message_type} message to {queue_name}: {message.task_id}")
             return True
         except Exception as e:
             logger.error(f"Failed to publish message to {queue_name}: {e}")
+            logger.exception(e)  # Log full traceback
             return False
 
     def subscribe_async(self, queue_name: str, callback: Callable[[QueueMessage], None]):

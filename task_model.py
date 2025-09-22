@@ -289,9 +289,17 @@ class TaskManager:
         """Trigger callback asynchronously"""
         import asyncio
         import aiohttp
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info(f"[DEBUG] Triggering async callback for task {task.task_id}")
+        logger.debug(f"[DEBUG] Task details: task_id={task.task_id}, status={task.status}, callback_url={task.callback_url}")
 
         async def _callback():
             try:
+                logger.info(f"[DEBUG] Starting async callback for task {task.task_id} to {task.callback_url}")
+                logger.info(f"[DEBUG] Task details: task_id={task.task_id}, status={task.status}, callback_url={task.callback_url}")
+
                 async with aiohttp.ClientSession() as session:
                     payload = {
                         "task_id": task.task_id,
@@ -300,13 +308,37 @@ class TaskManager:
                         "srt_url": f"/api/v1/tasks/{task.task_id}/download" if task.srt_file_path else None
                     }
 
-                    await session.post(task.callback_url, json=payload, timeout=aiohttp.ClientTimeout(total=30))
+                    logger.debug(f"[DEBUG] Callback payload: {payload}")
+                    logger.info(f"[DEBUG] Sending POST request to {task.callback_url}")
+
+                    response = await session.post(
+                        task.callback_url,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "Tus-ASR-Task-Manager/1.0"
+                        }
+                    )
+
+                    logger.info(f"[DEBUG] Callback response for task {task.task_id}: status={response.status}")
+                    if response.status != 200:
+                        response_text = await response.text()
+                        logger.warning(f"[DEBUG] Callback for task {task.task_id} returned status {response.status}: {response_text}")
+                    else:
+                        logger.info(f"[DEBUG] Callback for task {task.task_id} successful")
+
+            except asyncio.TimeoutError as e:
+                logger.error(f"[DEBUG] Callback timeout for task {task.task_id}: {e}")
+                logger.info(f"[DEBUG] Timeout details: URL={task.callback_url}, timeout=30s")
             except Exception as e:
-                print(f"Callback failed for task {task.task_id}: {e}")
+                logger.error(f"[DEBUG] Callback failed for task {task.task_id}: {e}")
+                logger.exception(e)  # Log full traceback
 
         # Run in background thread pool
         import threading
-        threading.Thread(target=lambda: asyncio.run(_callback())).start()
+        logger.info(f"[DEBUG] Starting callback thread for task {task.task_id}")
+        threading.Thread(target=lambda: asyncio.run(_callback()), name=f"CallbackThread-{task.task_id}").start()
 
 
 # Global task manager instance

@@ -252,19 +252,38 @@ class ASRWorker:
     def _fail_task(self, task_id: str, error_message: str):
         """Mark task as failed and publish failure message"""
         try:
+            logger.info(f"Worker {self.worker_id}: Failing task {task_id} with error: {error_message}")
+
             # Update task status
             success = self.task_manager.fail_task(task_id, error_message)
 
             if success:
+                logger.info(f"Worker {self.worker_id}: Successfully updated task {task_id} status to failed")
                 # Publish failure message
-                self.message_queue.publish_asr_failed(task_id, error_message)
+                logger.info(f"Worker {self.worker_id}: Publishing ASR failed message for task {task_id}")
+                publish_success = self.message_queue.publish_asr_failed(task_id, error_message)
+                if publish_success:
+                    logger.info(f"Worker {self.worker_id}: Successfully published ASR failed message for task {task_id}")
+                else:
+                    logger.error(f"Worker {self.worker_id}: Failed to publish ASR failed message for task {task_id}")
+
                 self.failed_count += 1
                 logger.error(f"Worker {self.worker_id}: Task {task_id} failed: {error_message}")
             else:
                 logger.error(f"Worker {self.worker_id}: Failed to update task {task_id} failure status")
+                # Try to get task details for debugging
+                try:
+                    task = self.task_manager.get_task(task_id)
+                    if task:
+                        logger.debug(f"Worker {self.worker_id}: Task {task_id} details: status={task.status}, callback_url={task.callback_url}")
+                    else:
+                        logger.error(f"Worker {self.worker_id}: Task {task_id} not found in database")
+                except Exception as e:
+                    logger.error(f"Worker {self.worker_id}: Error getting task details for {task_id}: {e}")
 
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error failing task {task_id}: {e}")
+            logger.exception(e)  # Log full traceback
 
     def get_stats(self) -> Dict[str, Any]:
         """Get worker statistics"""

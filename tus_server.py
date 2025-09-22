@@ -35,6 +35,7 @@ MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "500")) * 1024 * 1024  # 500MB de
 CHUNK_SIZE = 64 * 1024  # 64KB chunks
 CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "3600"))  # 1 hour
 TUS_SERVER_PORT = int(os.getenv("TUS_SERVER_PORT", "1080"))
+SHOW_PROGRESS_LOGS = os.getenv("SHOW_PROGRESS_LOGS", "false").lower() == "true"  # Enable detailed progress logs
 
 # Ensure upload directory exists
 Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
@@ -106,7 +107,8 @@ class TusServer:
         self.db = TusDatabase()
         self.upload_dir = Path(UPLOAD_DIR)
         self.max_file_size = MAX_FILE_SIZE
-        self.active_uploads = {}  # Track active uploads
+        self.show_progress_logs = SHOW_PROGRESS_LOGS
+        self.active_uploads = {}  # Track active uploads with progress data
 
         # Create aiohttp app with large client size for file uploads
         self.app = web.Application(client_max_size=600*1024*1024)  # 600MB
@@ -300,8 +302,71 @@ class TusServer:
                 asyncio.create_task(self.handle_upload_completion(upload_id, upload_record))
 
                 logger.info(f"Upload {upload_id} completed")
+
+                # Clear progress tracking data
+                if upload_id in self.active_uploads:
+                    del self.active_uploads[upload_id]
             else:
-                logger.debug(f"Upload {upload_id} progress: {new_offset}/{upload_record['length']} bytes")
+                # Calculate progress percentage
+                progress_percent = (new_offset / upload_record['length']) * 100
+
+                # Track upload progress for speed estimation
+                import time
+                current_time = time.time()
+
+                if self.show_progress_logs:
+                    if upload_id not in self.active_uploads:
+                        # First chunk for this upload
+                        self.active_uploads[upload_id] = {
+                            'start_time': current_time,
+                            'start_offset': upload_offset,
+                            'last_time': current_time,
+                            'last_offset': upload_offset
+                        }
+                        logger.info(f"Upload {upload_id} progress: {new_offset}/{upload_record['length']} bytes ({progress_percent:.1f}%)")
+                    else:
+                        # Update progress tracking data
+                        upload_data = self.active_uploads[upload_id]
+                        previous_time = upload_data['last_time']
+                        previous_offset = upload_data['last_offset']
+                        upload_data['last_time'] = current_time
+                        upload_data['last_offset'] = new_offset
+
+                        # Calculate instantaneous speed (bytes/second) over last chunk
+                        chunk_size = new_offset - previous_offset
+                        chunk_time = current_time - previous_time + 0.001  # Add small value to prevent division by zero
+                        instant_speed = chunk_size / chunk_time
+
+                        # Calculate overall speed (bytes/second)
+                        overall_time = current_time - upload_data['start_time']
+                        overall_speed = (new_offset - upload_data['start_offset']) / (overall_time + 0.001)  # Add small value to prevent division by zero
+
+                        # Estimate remaining time
+                        remaining_bytes = upload_record['length'] - new_offset
+                        if overall_speed > 0:
+                            remaining_time = remaining_bytes / overall_speed
+                            # Format remaining time in a human-readable format
+                            if remaining_time < 60:
+                                remaining_str = f"{remaining_time:.0f}s"
+                            elif remaining_time < 3600:
+                                remaining_str = f"{remaining_time/60:.1f}m"
+                            else:
+                                remaining_str = f"{remaining_time/3600:.1f}h"
+                        else:
+                            remaining_str = "unknown"
+
+                        # Format speeds in human-readable format
+                        def format_speed(speed_bytes):
+                            if speed_bytes < 1024:
+                                return f"{speed_bytes:.0f} B/s"
+                            elif speed_bytes < 1024 * 1024:
+                                return f"{speed_bytes/1024:.1f} KB/s"
+                            else:
+                                return f"{speed_bytes/(1024*1024):.1f} MB/s"
+
+                        logger.info(f"Upload {upload_id} progress: {new_offset}/{upload_record['length']} bytes ({progress_percent:.1f}%) - "
+                                  f"Speed: {format_speed(overall_speed)} (inst: {format_speed(instant_speed)}) - "
+                                  f"ETA: {remaining_str}")
 
             return web.Response(
                 status=204,
@@ -332,6 +397,10 @@ class TusServer:
 
             # Mark as cancelled in database
             self.db.update_upload_offset(upload_id, -1)  # Special value for cancelled
+
+            # Clear progress tracking data
+            if upload_id in self.active_uploads:
+                del self.active_uploads[upload_id]
 
             logger.info(f"Deleted upload {upload_id}")
             return web.Response(status=204)
@@ -487,6 +556,7 @@ async def main():
     logger.info(f"Starting Tus.io server on port {TUS_SERVER_PORT}")
     logger.info(f"Upload directory: {tus_server.upload_dir}")
     logger.info(f"Max file size: {tus_server.max_file_size // (1024*1024)}MB")
+    logger.info(f"Progress logs enabled: {tus_server.show_progress_logs}")
 
     runner = web.AppRunner(
         tus_server.app,

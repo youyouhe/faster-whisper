@@ -142,11 +142,16 @@ class CallbackService:
         task_id = message.task_id
 
         try:
+            logger.info(f"Handling {status} callback for task {task_id}")
+            logger.debug(f"Message data: {message.data}")
+
             # Get task details
             task = self.task_manager.get_task(task_id)
             if not task:
                 logger.error(f"Task {task_id} not found for callback")
                 return
+
+            logger.debug(f"Task details: task_id={task.task_id}, status={task.status}, callback_url={task.callback_url}")
 
             if not task.callback_url:
                 logger.debug(f"Task {task_id} has no callback URL")
@@ -154,12 +159,15 @@ class CallbackService:
 
             # Prepare callback payload
             payload = self._prepare_callback_payload(task, message, status)
+            logger.debug(f"Prepared callback payload for task {task_id}: {payload}")
 
             # Send callback
+            logger.info(f"Sending callback for task {task_id} to {task.callback_url}")
             await self._send_callback_with_retry(task_id, task.callback_url, payload)
 
         except Exception as e:
             logger.error(f"Error handling {status} callback for {task_id}: {e}")
+            logger.exception(e)  # Log full traceback
 
     def _prepare_callback_payload(self, task, message: QueueMessage, status: str) -> Dict[str, Any]:
         """Prepare the callback payload based on status"""
@@ -190,18 +198,23 @@ class CallbackService:
 
     async def _send_callback_with_retry(self, task_id: str, callback_url: str, payload: Dict[str, Any]):
         """Send callback with retry logic"""
+        logger.info(f"Starting callback retry process for task {task_id} to {callback_url}")
+        logger.debug(f"Callback payload: {payload}")
+        logger.debug(f"Retry configuration: max_attempts={self.max_attempts}, retry_delay={self.retry_delay}s, timeout={self.timeout}s")
+
         async with self.semaphore:
             attempt = 0
 
             while attempt < self.max_attempts:
                 attempt += 1
+                logger.info(f"Callback attempt {attempt}/{self.max_attempts} for task {task_id}")
 
                 try:
                     success = await self._send_single_callback(callback_url, payload)
 
                     if success:
                         logger.info(f"Callback sent successfully for task {task_id} (attempt {attempt})")
-                        return
+                        return True
 
                     if attempt < self.max_attempts:
                         delay = self.retry_delay * (2 ** (attempt - 1))  # Exponential backoff
@@ -210,17 +223,28 @@ class CallbackService:
 
                 except Exception as e:
                     logger.error(f"Callback attempt {attempt} error for {task_id}: {e}")
+                    logger.exception(e)  # Log full traceback
                     if attempt < self.max_attempts:
                         await asyncio.sleep(self.retry_delay)
                     else:
                         logger.error(f"All callback attempts failed for task {task_id}")
+                        return False
+
+            logger.error(f"All {self.max_attempts} callback attempts exhausted for task {task_id}")
+            return False
 
     async def _send_single_callback(self, callback_url: str, payload: Dict[str, Any]) -> bool:
         """Send a single callback request"""
+        logger.info(f"Sending single callback request to {callback_url}")
+        logger.debug(f"Request payload: {payload}")
+        logger.debug(f"Request timeout: {self.timeout}s")
+
         try:
             timeout = aiohttp.ClientTimeout(total=self.timeout)
+            logger.debug(f"Created aiohttp client session with timeout {timeout.total}s")
 
             async with aiohttp.ClientSession(timeout=timeout) as session:
+                logger.debug("Created client session, sending POST request")
                 async with session.post(
                     callback_url,
                     json=payload,
@@ -229,17 +253,21 @@ class CallbackService:
                         "User-Agent": "Tus-ASR-Callback-Service/1.0"
                     }
                 ) as response:
+                    logger.info(f"Callback response received: status={response.status}")
                     if response.status == 200:
+                        logger.info(f"Callback successful for {callback_url}")
                         return True
                     else:
-                        logger.warning(f"Callback returned status {response.status}: {await response.text()}")
+                        response_text = await response.text()
+                        logger.warning(f"Callback returned status {response.status}: {response_text}")
                         return False
 
         except asyncio.TimeoutError:
-            logger.warning(f"Callback timeout for URL: {callback_url}")
+            logger.warning(f"Callback timeout for URL: {callback_url} (timeout={self.timeout}s)")
             return False
         except Exception as e:
             logger.error(f"Callback error for URL {callback_url}: {e}")
+            logger.exception(e)  # Log full traceback
             return False
 
 async def main():
