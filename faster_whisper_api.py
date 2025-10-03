@@ -24,6 +24,9 @@ import pydub
 from pydub import AudioSegment
 import numpy as np
 
+# Import authentication middleware
+from auth_middleware import get_auth, require_auth
+
 # Simplified middleware - only add necessary headers without touching response body
 class SimpleResponseMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -538,11 +541,15 @@ async def test_json_response():
 
 @app.post("/inference")
 async def inference(
+    request: Request,
     file: UploadFile = File(...),
     response_format: str = Form("srt"),
     language: str = Form("auto")
 ):
     """ASR inference endpoint compatible with existing clients - 优化流式上传"""
+
+    # Require API key authentication
+    require_auth(request)
 
     # Validate response format
     if response_format != "srt":

@@ -36,12 +36,14 @@ class TusClient:
                  tus_url: str = "http://localhost:1080",
                  callback_listener_port: int = 9090,
                  callback_host: str = "auto",
-                 max_retries: int = 3):
+                 max_retries: int = 3,
+                 api_key: Optional[str] = None):
         self.api_url = api_url.rstrip('/')
         self.tus_url = tus_url.rstrip('/')
         self.callback_port = callback_listener_port
         self.callback_host = callback_host
         self.max_retries = max_retries
+        self.api_key = api_key
         self.completed_tasks = {}
         self.running = True
 
@@ -166,11 +168,17 @@ class TusClient:
 
         logger.info(f"Creating task with payload: {json.dumps(payload, indent=2)}")
 
+        # Prepare headers with API key if available
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+
         # Use synchronous requests for API calls (easier to handle)
         # In a production setup, you might want to use aiohttp
         response = requests.post(
             f"{self.api_url}/api/v1/asr-tasks",
             json=payload,
+            headers=headers,
             timeout=30
         )
 
@@ -215,6 +223,10 @@ class TusClient:
             'Upload-Metadata': ', '.join(metadata_parts)
         }
 
+        # Add API key if available
+        if self.api_key:
+            headers['X-API-Key'] = self.api_key
+
         async with aiohttp.ClientSession() as session:
             url = f"{self.tus_url}/files"
             logger.info(f"Creating TUS upload at {url}")
@@ -257,6 +269,10 @@ class TusClient:
                         'Upload-Offset': str(offset),
                         'Content-Type': 'application/offset+octet-stream'
                     }
+
+                    # Add API key if available
+                    if self.api_key:
+                        headers['X-API-Key'] = self.api_key
 
                     url = f"{self.tus_url}/files/{upload_id}"
                     logger.info(f"Uploading chunk: offset={offset}, size={len(chunk)}")
@@ -395,7 +411,12 @@ class TusClient:
             async with aiohttp.ClientSession() as session:
                 url = f"{self.api_url}/api/v1/asr-tasks/{task_id}/status"
 
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                # Prepare headers with API key if available
+                headers = {}
+                if self.api_key:
+                    headers["X-API-Key"] = self.api_key
+
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
                     if response.status == 200:
                         return await response.json()
                     else:
@@ -412,7 +433,12 @@ class TusClient:
             logger.info(f"Downloading SRT from: {srt_url}")
 
             async with aiohttp.ClientSession() as session:
-                async with session.get(srt_url, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                # Prepare headers with API key if available
+                headers = {}
+                if self.api_key:
+                    headers["X-API-Key"] = self.api_key
+
+                async with session.get(srt_url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as response:
                     response.raise_for_status()
 
                     # Try to parse as JSON first (matches load_balancer format)
@@ -536,6 +562,7 @@ def main():
     parser.add_argument('--tus-url', default='http://localhost:1080', help='TUS server URL')
     parser.add_argument('--callback-port', type=int, default=9090, help='Callback listener port')
     parser.add_argument('--callback-host', default='auto', help='Callback host IP (use "auto" for auto-detection, "localhost" for local testing)')
+    parser.add_argument('--api-key', help='API key for authentication')
     parser.add_argument('--language', default='auto', help='Audio language')
     parser.add_argument('--model', default='large-v3-turbo', help='Whisper model')
     parser.add_argument('--output', help='Output file for SRT content')
@@ -547,7 +574,8 @@ def main():
         api_url=args.api_url,
         tus_url=args.tus_url,
         callback_listener_port=args.callback_port,
-        callback_host=args.callback_host
+        callback_host=args.callback_host,
+        api_key=args.api_key
     )
 
     metadata = {

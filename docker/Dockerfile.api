@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir \
     python-multipart
 
 # Copy required files
-COPY tus_api_server.py callback_service.py task_model.py message_queue.py distributed_processor.py audio_splitter.py srt_merger.py ./
+COPY tus_api_server.py callback_service.py task_model.py message_queue.py distributed_processor.py audio_splitter.py srt_merger.py auth_middleware.py ./
 
 # Setup
 RUN mkdir -p /data /logs /data/srt_results

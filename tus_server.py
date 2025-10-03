@@ -24,6 +24,7 @@ import shutil
 
 # Import database components
 from tus_database import TusDatabase
+from auth_middleware import get_auth, require_auth
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,7 +36,7 @@ MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "500")) * 1024 * 1024  # 500MB de
 CHUNK_SIZE = 64 * 1024  # 64KB chunks
 CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "3600"))  # 1 hour
 TUS_SERVER_PORT = int(os.getenv("TUS_SERVER_PORT", "1080"))
-SHOW_PROGRESS_LOGS = os.getenv("SHOW_PROGRESS_LOGS", "false").lower() == "true"  # Enable detailed progress logs
+SHOW_PROGRESS_LOGS = os.getenv("SHOW_PROGRESS_LOGS", "true").lower() == "true"  # Enable detailed progress logs
 
 # Ensure upload directory exists
 Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
@@ -121,7 +122,15 @@ class TusServer:
         self.app.router.add_get('/health', self.health_check)
 
     async def create_upload(self, request):
-        """Create a new upload (POST /files)"""
+        """Create a new upload (POST /files) with API key authentication"""
+        # Check API key authentication
+        auth = get_auth()
+        if auth.api_key:  # Only check if API key is configured
+            api_key = request.headers.get('X-API-Key')
+            if not api_key or api_key != auth.api_key:
+                logger.warning(f"Invalid or missing API key from {request.remote}")
+                return web.Response(status=401, text="Invalid or missing API key")
+
         try:
             # Parse Tus headers
             upload_length = request.headers.get('Upload-Length')
@@ -193,6 +202,14 @@ class TusServer:
         """Check upload status (HEAD /files/{upload_id})"""
         upload_id = request.match_info['upload_id']
 
+        # Check API key authentication
+        auth = get_auth()
+        if auth.api_key:  # Only check if API key is configured
+            api_key = request.headers.get('X-API-Key')
+            if not api_key or api_key != auth.api_key:
+                logger.warning(f"Invalid or missing API key from {request.remote}")
+                return web.Response(status=401, text="Invalid or missing API key")
+
         try:
             # Get upload record
             upload_record = self.db.get_upload(upload_id)
@@ -247,6 +264,14 @@ class TusServer:
     async def patch_upload(self, request):
         """Upload file chunk (PATCH /files/{upload_id})"""
         upload_id = request.match_info['upload_id']
+
+        # Check API key authentication
+        auth = get_auth()
+        if auth.api_key:  # Only check if API key is configured
+            api_key = request.headers.get('X-API-Key')
+            if not api_key or api_key != auth.api_key:
+                logger.warning(f"Invalid or missing API key from {request.remote}")
+                return web.Response(status=401, text="Invalid or missing API key")
 
         try:
             # Validate Tus headers
@@ -383,6 +408,14 @@ class TusServer:
     async def delete_upload(self, request):
         """Delete an upload (DELETE /files/{upload_id})"""
         upload_id = request.match_info['upload_id']
+
+        # Check API key authentication
+        auth = get_auth()
+        if auth.api_key:  # Only check if API key is configured
+            api_key = request.headers.get('X-API-Key')
+            if not api_key or api_key != auth.api_key:
+                logger.warning(f"Invalid or missing API key from {request.remote}")
+                return web.Response(status=401, text="Invalid or missing API key")
 
         try:
             # Get upload record

@@ -22,6 +22,9 @@ import re
 # Import distributed processing components
 from distributed_processor import DistributedProcessor
 
+# Import authentication middleware
+from auth_middleware import get_auth
+
 # SQLite database setup
 import sqlite3
 from pathlib import Path
@@ -612,6 +615,18 @@ async def process_request_on_backend(backend: str, request: web.Request, request
 
 async def inference_handler(request):
     """Handle inference requests by queuing and forwarding to backend services"""
+    # Check API key authentication
+    auth = get_auth()
+    if auth.api_key:  # Only check if API key is configured
+        api_key = request.headers.get('X-API-Key')
+        if not api_key or api_key != auth.api_key:
+            logger.warning(f"Invalid or missing API key from {request.remote}")
+            return web.Response(
+                status=401,
+                text='{"code": 401, "msg": "Invalid or missing API key", "data": ""}',
+                content_type='application/json'
+            )
+
     try:
         request_id = str(uuid.uuid4())
         logger.info(f"Received inference request {request_id}")

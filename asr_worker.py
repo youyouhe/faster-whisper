@@ -31,6 +31,7 @@ SHUTDOWN_TIMEOUT = int(os.getenv("SHUTDOWN_TIMEOUT", "30"))
 WORKER_POLL_INTERVAL = int(os.getenv("WORKER_POLL_INTERVAL", "5"))
 SRT_STORAGE_DIR = os.getenv("SRT_STORAGE_DIR", "/data/srt_results")
 LOAD_BALANCER_URL = os.getenv("LOAD_BALANCER_URL", "http://faster-whisper-dynamic:5001")
+API_KEY = os.getenv("API_KEY", "")  # API key for load balancer authentication
 
 # Ensure SRT storage directory exists
 Path(SRT_STORAGE_DIR).mkdir(parents=True, exist_ok=True)
@@ -222,10 +223,16 @@ class ASRWorker:
 
             logger.info(f"Worker {self.worker_id}: Using {timeout_seconds}s timeout for {file_size_mb:.1f}MB file")
 
+            # Prepare headers with API key if available
+            headers = {}
+            if API_KEY:
+                headers["X-API-Key"] = API_KEY
+
             response = requests.post(
                 url,
                 files=files,
                 data=data,
+                headers=headers,
                 timeout=timeout_seconds
             )
 

@@ -9,7 +9,7 @@ import uuid
 from typing import Dict, Optional, Any
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, Field
 import uvicorn
@@ -20,6 +20,7 @@ import json
 
 # Import existing components
 from task_model import get_task_manager
+from auth_middleware import get_auth, require_auth
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -98,7 +99,8 @@ async def notify_callback(callback_url: str, task_data: dict):
 @app.post("/api/v1/asr-tasks", response_model=TaskResponse)
 async def create_asr_task(
     request: TaskRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    http_request: Request
 ):
     """
     Create a new ASR task with Tus resumable upload
@@ -106,6 +108,9 @@ async def create_asr_task(
     This endpoint creates a task record and returns a Tus upload URL
     where the client can upload their audio file with resumable capabilities.
     """
+    # Require API key authentication
+    require_auth(http_request)
+
     try:
         # Get TaskManager instance (consistent with workers)
         task_manager = get_task_manager()
@@ -145,7 +150,7 @@ async def create_asr_task(
         raise HTTPException(status_code=500, detail=f"Failed to create task: {str(e)}")
 
 @app.get("/api/v1/asr-tasks/{task_id}", response_model=TaskStatusResponse)
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, http_request: Request):
     """
     Get the current status of an ASR task
 
@@ -155,6 +160,9 @@ async def get_task_status(task_id: str):
     - SRT result URL (if completed)
     - Error messages (if failed)
     """
+    # Require API key authentication
+    require_auth(http_request)
+
     try:
         task_manager = get_task_manager()
         task = task_manager.get_task(task_id)
@@ -186,7 +194,8 @@ async def get_task_status(task_id: str):
 @app.get("/api/v1/tasks")
 async def list_tasks(
     status: Optional[str] = None,
-    limit: int = 50
+    limit: int = 50,
+    http_request: Request = None
 ):
     """
     List ASR tasks with optional filtering by status
@@ -195,6 +204,10 @@ async def list_tasks(
     - status: Filter by task status (optional)
     - limit: Maximum number of tasks to return (default: 50)
     """
+    # Require API key authentication
+    if http_request:
+        require_auth(http_request)
+
     try:
         task_manager = get_task_manager()
 
@@ -229,12 +242,15 @@ async def list_tasks(
         raise HTTPException(status_code=500, detail=f"Failed to list tasks: {str(e)}")
 
 @app.get("/api/v1/tasks/{task_id}/download")
-async def download_srt(task_id: str):
+async def download_srt(task_id: str, http_request: Request):
     """
     Download the SRT file for a completed ASR task
 
     Returns the SRT subtitle file content as plain text.
     """
+    # Require API key authentication
+    require_auth(http_request)
+
     try:
         task_manager = get_task_manager()
         task = task_manager.get_task(task_id)

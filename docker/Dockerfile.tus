@@ -12,10 +12,12 @@ WORKDIR /app
 # Install exact TUS server dependencies
 RUN pip install --no-cache-dir \
     aiohttp \
-    redis
+    redis \
+    fastapi \
+    starlette
 
 # Copy required files
-COPY tus_server.py task_model.py message_queue.py tus_database.py ./
+COPY tus_server.py task_model.py message_queue.py tus_database.py auth_middleware.py ./
 
 # Setup
 RUN mkdir -p /data/uploads /logs
