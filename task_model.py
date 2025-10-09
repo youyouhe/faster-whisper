@@ -240,7 +240,15 @@ class TaskManager:
 
     def fail_task(self, task_id: str, error_message: str) -> bool:
         """Mark task as failed with error message"""
-        return self.update_task_status(task_id, "failed", error_message=error_message)
+        success = self.update_task_status(task_id, "failed", error_message=error_message)
+
+        # Trigger callback if configured and task update was successful
+        if success:
+            task = self.get_task(task_id)
+            if task and task.callback_url:
+                self._trigger_callback_async(task)
+
+        return success
 
     def update_audio_file(self, task_id: str, audio_path: str) -> bool:
         """Update the audio file path after upload"""
@@ -286,7 +294,7 @@ class TaskManager:
             return deleted_count
 
     def _trigger_callback_async(self, task: TaskRecord):
-        """Trigger callback asynchronously"""
+        """Trigger callback asynchronously with retry mechanism"""
         import asyncio
         import aiohttp
         import logging
@@ -296,44 +304,81 @@ class TaskManager:
         logger.debug(f"[DEBUG] Task details: task_id={task.task_id}, status={task.status}, callback_url={task.callback_url}")
 
         async def _callback():
-            try:
-                logger.info(f"[DEBUG] Starting async callback for task {task.task_id} to {task.callback_url}")
-                logger.info(f"[DEBUG] Task details: task_id={task.task_id}, status={task.status}, callback_url={task.callback_url}")
+            max_retries = 3
+            base_delay = 2  # Base delay in seconds
 
-                async with aiohttp.ClientSession() as session:
-                    payload = {
-                        "task_id": task.task_id,
-                        "status": task.status,
-                        "filename": task.filename,
-                        "srt_url": f"/api/v1/tasks/{task.task_id}/download" if task.srt_file_path else None
-                    }
+            for attempt in range(1, max_retries + 1):
+                try:
+                    logger.info(f"[DEBUG] Starting async callback for task {task.task_id} to {task.callback_url} (attempt {attempt}/{max_retries})")
+                    logger.info(f"[DEBUG] Task details: task_id={task.task_id}, status={task.status}, callback_url={task.callback_url}")
 
-                    logger.debug(f"[DEBUG] Callback payload: {payload}")
-                    logger.info(f"[DEBUG] Sending POST request to {task.callback_url}")
+                    async with aiohttp.ClientSession() as session:
+                        # Prepare callback payload based on task status
+                        if task.status == "completed":
+                            payload = {
+                                "task_id": task.task_id,
+                                "status": task.status,
+                                "filename": task.filename,
+                                "srt_url": f"/api/v1/tasks/{task.task_id}/download" if task.srt_file_path else None,
+                                "processing_time": task.processing_time,
+                                "completed_at": task.completed_at.isoformat() if task.completed_at else None
+                            }
+                        elif task.status == "failed":
+                            payload = {
+                                "task_id": task.task_id,
+                                "status": task.status,
+                                "filename": task.filename,
+                                "error_message": task.error_message,
+                                "failed_at": task.updated_at.isoformat() if task.updated_at else None
+                            }
+                        else:
+                            # Handle other statuses if needed
+                            payload = {
+                                "task_id": task.task_id,
+                                "status": task.status,
+                                "filename": task.filename,
+                                "updated_at": task.updated_at.isoformat() if task.updated_at else None
+                            }
 
-                    response = await session.post(
-                        task.callback_url,
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=30),
-                        headers={
-                            "Content-Type": "application/json",
-                            "User-Agent": "Tus-ASR-Task-Manager/1.0"
-                        }
-                    )
+                        logger.debug(f"[DEBUG] Callback payload: {payload}")
+                        logger.info(f"[DEBUG] Sending POST request to {task.callback_url}")
 
-                    logger.info(f"[DEBUG] Callback response for task {task.task_id}: status={response.status}")
-                    if response.status != 200:
-                        response_text = await response.text()
-                        logger.warning(f"[DEBUG] Callback for task {task.task_id} returned status {response.status}: {response_text}")
-                    else:
-                        logger.info(f"[DEBUG] Callback for task {task.task_id} successful")
+                        response = await session.post(
+                            task.callback_url,
+                            json=payload,
+                            timeout=aiohttp.ClientTimeout(total=30),
+                            headers={
+                                "Content-Type": "application/json",
+                                "User-Agent": "Tus-ASR-Task-Manager/1.0"
+                            }
+                        )
 
-            except asyncio.TimeoutError as e:
-                logger.error(f"[DEBUG] Callback timeout for task {task.task_id}: {e}")
-                logger.info(f"[DEBUG] Timeout details: URL={task.callback_url}, timeout=30s")
-            except Exception as e:
-                logger.error(f"[DEBUG] Callback failed for task {task.task_id}: {e}")
-                logger.exception(e)  # Log full traceback
+                        logger.info(f"[DEBUG] Callback response for task {task.task_id}: status={response.status}")
+                        if response.status != 200:
+                            response_text = await response.text()
+                            logger.warning(f"[DEBUG] Callback for task {task.task_id} returned status {response.status}: {response_text}")
+                            # If it's a client error (4xx), don't retry
+                            if 400 <= response.status < 500:
+                                logger.error(f"[DEBUG] Client error for task {task.task_id}, not retrying")
+                                break
+                        else:
+                            logger.info(f"[DEBUG] Callback for task {task.task_id} successful on attempt {attempt}")
+                            return  # Success, exit retry loop
+
+                except asyncio.TimeoutError as e:
+                    logger.error(f"[DEBUG] Callback timeout for task {task.task_id} on attempt {attempt}: {e}")
+                    logger.info(f"[DEBUG] Timeout details: URL={task.callback_url}, timeout=30s")
+                except Exception as e:
+                    logger.error(f"[DEBUG] Callback failed for task {task.task_id} on attempt {attempt}: {e}")
+                    logger.exception(e)  # Log full traceback
+
+                # If this is not the last attempt, wait before retrying
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** (attempt - 1))  # Exponential backoff: 2s, 4s, 8s
+                    logger.info(f"[DEBUG] Retrying callback for task {task.task_id} in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"[DEBUG] All {max_retries} callback attempts failed for task {task.task_id}")
 
         # Run in background thread pool
         import threading
