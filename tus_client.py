@@ -56,7 +56,8 @@ class TusClient:
                  max_retries: int = 3,
                  api_key: Optional[str] = None,
                  simulate_callback_failure: bool = False,
-                 callback_failure_duration: int = 60):
+                 callback_failure_duration: int = 60,
+                 chunk_size: int = 1024 * 1024):
         self.api_url = api_url.rstrip('/')
         self.tus_url = tus_url.rstrip('/')
         self.callback_port = callback_listener_port
@@ -73,6 +74,9 @@ class TusClient:
         self.callback_failure_duration = callback_failure_duration
         self.callback_server_stopped = False
         self.callback_failure_start_time = None
+
+        # TUS upload settings
+        self.chunk_size = chunk_size
 
         # Signal handling
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -234,6 +238,10 @@ class TusClient:
         srt_content = await self._wait_for_results(task_id)
 
         logger.info("✅ ASR processing completed")
+
+        # Auto-save result with timestamp for verification
+        self._auto_save_result(task_id, srt_content, audio_file_path)
+
         return srt_content
 
     async def _create_task(self, audio_file_path: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -302,7 +310,7 @@ class TusClient:
         audio_path = Path(audio_file_path)
         file_size = audio_path.stat().st_size
 
-        logger.info(f"Uploading {audio_path.name} ({file_size} bytes)")
+        logger.info(f"Uploading {audio_path.name} ({file_size} bytes) with chunk size {self.chunk_size:,} bytes")
 
         # Step 1: Create upload (POST to Tus endpoint)
         upload_id = await self._create_tus_upload(upload_url.split('/')[-1], file_size, audio_path.name)
@@ -351,8 +359,8 @@ class TusClient:
 
     async def _upload_tus_data(self, upload_id: str, file_path: Path) -> None:
         """Upload file data to TUS server"""
-        chunk_size = 1024 * 1024  # 1MB chunks
         offset = 0
+        chunk_size = self.chunk_size
 
         with open(file_path, 'rb') as f:
             comperator = lambda f: f.seek(0, 2) or f.tell()
@@ -677,6 +685,30 @@ class TusClient:
         except Exception as e:
             logger.error(f"Callback server failed: {e}")
 
+    def _auto_save_result(self, task_id: str, srt_content: str, original_file_path: str):
+        """Automatically save SRT result with timestamp and task ID for verification"""
+        try:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            original_name = Path(original_file_path).stem
+
+            # Create verification directory if it doesn't exist
+            verification_dir = Path("verification_results")
+            verification_dir.mkdir(exist_ok=True)
+
+            # Create filename with timestamp, task ID, and original filename
+            verification_filename = f"{timestamp}_{task_id[:8]}_{original_name}.srt"
+            verification_path = verification_dir / verification_filename
+
+            # Save the SRT content
+            with open(verification_path, 'w', encoding='utf-8') as f:
+                f.write(srt_content)
+
+            logger.info(f"✅ Auto-saved verification result to: {verification_path}")
+
+        except Exception as e:
+            logger.warning(f"Failed to auto-save verification result: {e}")
+
 
 def main():
     """Main entry point"""
@@ -703,6 +735,7 @@ def main():
     parser.add_argument('--simulate-callback-failure', action='store_true', help='Simulate callback failure by stopping callback server temporarily')
     parser.add_argument('--callback-failure-duration', type=int, default=60, help='Duration in seconds to simulate callback failure')
     parser.add_argument('--sequential', action='store_true', help='Process files sequentially instead of concurrently')
+    parser.add_argument('--chunk-size', type=int, default=1024*1024, help='TUS upload chunk size in bytes (default: 1MB)')
 
     args = parser.parse_args()
 
@@ -732,7 +765,8 @@ def main():
         callback_host=args.callback_host,
         api_key=args.api_key,  # Will be auto-detected from .env if None
         simulate_callback_failure=args.simulate_callback_failure,
-        callback_failure_duration=args.callback_failure_duration
+        callback_failure_duration=args.callback_failure_duration,
+        chunk_size=args.chunk_size
     )
 
     # Log API key status (for debugging)
@@ -760,11 +794,18 @@ def main():
                     f.write(srt_content)
                 logger.info(f"SRT content saved to {args.output}")
             else:
+                # Always save to a default file for verification
+                default_output = f"result_{Path(expanded_files[0]).stem}.srt"
+                with open(default_output, 'w', encoding='utf-8') as f:
+                    f.write(srt_content)
+                logger.info(f"SRT content saved to {default_output} for verification")
+
                 print("\n" + "="*50)
                 print("SRT TRANSCRIPTION RESULT:")
                 print("="*50)
                 print(srt_content)
                 print("="*50)
+                print(f"Result also saved to: {default_output}")
 
         else:
             # Multiple file/request processing
@@ -806,34 +847,40 @@ def main():
                 results['failed'] = enhanced_failed
 
             # Handle output for multiple files
+            # Always use a default output directory if none specified
             if args.output_dir:
                 output_dir = Path(args.output_dir)
-                output_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                output_dir = Path("srt_results")  # Default output directory
 
-                for file_path, srt_content in results['successful']:
-                    input_path = Path(file_path)
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-                    # Extract base filename (remove request number suffix if present)
-                    base_name = input_path.stem
-                    if " (#" in base_name:
-                        base_name = base_name.split(" (#")[0]
+            # Track request numbers for each base filename
+            request_counters = {}
 
-                    # Create unique filename by adding request number if needed
-                    if args.count > 1:
-                        # Extract request number from the display name
-                        if " (#" in file_path:
-                            request_num = file_path.split(" (#")[1].rstrip(")")
-                            output_file = output_dir / f"{base_name}_request_{request_num}.srt"
-                        else:
-                            # Fallback: use counter
-                            counter = sum(1 for f in output_dir.glob(f"{base_name}_request_*.srt")) + 1
-                            output_file = output_dir / f"{base_name}_request_{counter}.srt"
+            for file_path, srt_content in results['successful']:
+                input_path = Path(file_path)
+                base_name = input_path.stem
+
+                # Create unique filename by adding request number if needed
+                if args.count > 1:
+                    # Use a counter for each base filename
+                    if base_name not in request_counters:
+                        request_counters[base_name] = 1
                     else:
-                        output_file = output_dir / f"{base_name}.srt"
+                        request_counters[base_name] += 1
 
-                    with open(output_file, 'w', encoding='utf-8') as f:
-                        f.write(srt_content)
-                    logger.info(f"Saved: {output_file}")
+                    request_num = request_counters[base_name]
+                    output_file = output_dir / f"{base_name}_request_{request_num}.srt"
+                else:
+                    output_file = output_dir / f"{base_name}.srt"
+
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(srt_content)
+                logger.info(f"Saved: {output_file}")
+
+            if not args.output_dir:
+                logger.info(f"All results saved to default directory: {output_dir}")
 
             # Print summary
             print("\n" + "="*60)
