@@ -9,7 +9,7 @@ export LD_LIBRARY_PATH=$(python3 -c "import nvidia.cublas.lib; import nvidia.cud
 detect_gpus() {
     echo "🔍 Detecting available GPUs..."
 
-    
+
     # Use Python script for robust GPU detection
     if [[ -f "/app/docker/detect_gpus.py" ]]; then
         GPU_COUNT=$(python3 /app/docker/detect_gpus.py 2>/dev/null)
