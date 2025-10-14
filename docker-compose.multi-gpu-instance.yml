@@ -1,0 +1,244 @@
+version: '3.8'
+
+services:
+  # Redis for message queue
+  redis:
+    image: redis:7-alpine
+    container_name: tus-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+  # Multi-GPU Multi-Instance faster-whisper Service
+  # Single container supporting all GPUs with multiple instances
+  faster-whisper-multi-gpu:
+    build:
+      context: .
+      dockerfile: docker/multi-instance/Dockerfile.multi-instance
+    image: faster-whisper-multi-gpu:latest
+    container_name: faster-whisper-multi-gpu
+    ports:
+      - "5002:5002"  # GPU service 0
+      - "5003:5003"  # GPU service 1
+      - "5004:5004"  # GPU service 2
+    environment:
+      # GPU Configuration - Use all available GPUs
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0,1,2
+
+      # Multi-GPU Multi-Instance Configuration
+      - GPU_IDS=0,1,2              # Use all 3 GPUs
+      - INSTANCES_PER_GPU=4       # 4 instances per GPU = 12 total instances
+      - MAX_QUEUE_SIZE=100        # Maximum tasks in queue
+      - MAX_CONCURRENT_TASKS=12   # Maximum concurrent transcription tasks
+      - MAX_FILE_SIZE_MB=50       # Maximum file size in MB
+
+      # Model Configuration
+      - WHISPER_MODEL=large-v3-turbo
+      - WHISPER_COMPUTE_TYPE=int8
+      - WHISPER_DEVICE=cuda
+
+      # API Configuration
+      - API_PORT=5002
+      - REQUEST_TIMEOUT=1800      # Request timeout in seconds (30 minutes)
+      - LOG_LEVEL=INFO
+
+      # CUDA Library Path Configuration
+      - LD_LIBRARY_PATH=/usr/local/cuda/lib64
+
+      # Authentication
+      - API_KEY=${API_KEY:-your-secret-api-key-here}
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all  # Use all available GPUs
+              capabilities: [gpu]
+        limits:
+          memory: 48G  # Higher memory limit for 3 GPUs with 4 instances each
+
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - multi_gpu_temp:/app/temp
+      - ./:/app  # Map entire source code directory to enable live code updates
+
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s  # Longer start period for model loading on 3 GPUs
+      retries: 3
+
+    depends_on:
+      - redis
+
+  # Load Balancer Service - Unified Entry Point
+  load-balancer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.load-balancer
+    image: faster-whisper-load-balancer:latest
+    container_name: faster-whisper-load-balancer
+    ports:
+      - "5001:5001"  # Main load balancer API port - Unified Entry Point
+    environment:
+      # Backend URLs for load balancing - pointing to single container's multiple ports
+      - BACKEND_URLS=http://faster-whisper-multi-gpu:5002,http://faster-whisper-multi-gpu:5003,http://faster-whisper-multi-gpu:5004
+
+      # Load Balancer Configuration
+      - LOAD_BALANCER_PORT=5001
+      - LOAD_BALANCER_ALGORITHM=round_robin  # or least_connections, random
+      - HEALTH_CHECK_INTERVAL=30
+      - HEALTH_CHECK_TIMEOUT=10
+      - MAX_RETRIES=3
+
+      # Authentication
+      - API_KEY=${API_KEY:-your-secret-api-key-here}
+
+      # Logging
+      - LOG_LEVEL=INFO
+
+    volumes:
+      - ./logs:/app/logs
+
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+    depends_on:
+      - faster-whisper-multi-gpu
+
+  # Original services (unchanged)
+  # Tus Server - Handles resumable uploads
+  tus-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.tus
+    container_name: tus-server
+    ports:
+      - "1080:1080"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_PATH=/data/tus_uploads.db
+      - DATA_DIR=/data
+      - UPLOAD_DIR=/data/uploads
+      - MAX_FILE_SIZE=500
+      - CLEANUP_INTERVAL=3600
+      - TUS_SERVER_PORT=1080
+      - API_KEY=${API_KEY:-your-secret-api-key-here}
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Tus API Server - Handles task creation and management
+  tus-api-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: tus-api-server
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_PATH=/data/tus_uploads.db
+      - DATA_DIR=/data
+      - UPLOAD_DIR=/data/uploads
+      - TUS_SERVER_BASE_URL=http://tus-server:1080/files
+      - CALLBACK_TIMEOUT=30
+      - API_PORT=8000
+      - API_KEY=${API_KEY:-your-secret-api-key-here}
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+    depends_on:
+      - redis
+      - tus-server
+      - load-balancer
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  callback-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.callback
+    container_name: callback-service
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - CALLBACK_MAX_ATTEMPTS=3
+      - CALLBACK_RETRY_DELAY=10
+      - CALLBACK_TIMEOUT=30
+      - CALLBACK_CONCURRENCY=10
+    volumes:
+      - ./logs:/logs
+      - ./:/app
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; r=redis.Redis(host='redis', port=6379); r.ping()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ASR Worker - Updated to use load balancer
+  asr-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    image: faster-whisper-asr-worker:latest
+    container_name: faster-whisper-asr-worker
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - LOAD_BALANCER_URL=http://load-balancer:5001  # Unified entry point
+      - DATABASE_PATH=/data/tus_uploads.db
+      - DATA_DIR=/data
+      - SRT_STORAGE_DIR=/data/srt_results
+      - API_KEY=${API_KEY:-your-secret-api-key-here}
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+      - ./data/srt_results:/data/srt_results
+      - ./:/app
+    depends_on:
+      - redis
+      - load-balancer
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 60s
+      timeout: 30s
+      start_period: 30s
+      retries: 3
+
+# Shared volumes
+volumes:
+  redis_data:
+    driver: local
+  multi_gpu_temp:
+    driver: local
