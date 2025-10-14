@@ -17,6 +17,23 @@ from typing import Dict, Any, Optional
 import logging
 import requests
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # If python-dotenv is not installed, try to read .env manually
+    def load_env_manually():
+        env_path = Path('.env')
+        if env_path.exists():
+            with open(env_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        os.environ[key.strip()] = value.strip()
+    load_env_manually()
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,15 +54,25 @@ class TusClient:
                  callback_listener_port: int = 9090,
                  callback_host: str = "auto",
                  max_retries: int = 3,
-                 api_key: Optional[str] = None):
+                 api_key: Optional[str] = None,
+                 simulate_callback_failure: bool = False,
+                 callback_failure_duration: int = 60):
         self.api_url = api_url.rstrip('/')
         self.tus_url = tus_url.rstrip('/')
         self.callback_port = callback_listener_port
         self.callback_host = callback_host
         self.max_retries = max_retries
-        self.api_key = api_key
+        # Auto-detect API key from environment if not provided
+        self.api_key = api_key or os.getenv('API_KEY')
         self.completed_tasks = {}
         self.running = True
+        self.callback_server_running = False
+        self.callback_thread = None
+        # Callback failure simulation settings
+        self.simulate_callback_failure = simulate_callback_failure
+        self.callback_failure_duration = callback_failure_duration
+        self.callback_server_stopped = False
+        self.callback_failure_start_time = None
 
         # Signal handling
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -55,6 +82,19 @@ class TusClient:
         """Handle shutdown signals"""
         logger.info(f"Received signal {signum}, shutting down...")
         self.running = False
+
+    def _ensure_callback_server(self):
+        """Ensure callback server is running (start it if not already running)"""
+        if not self.callback_server_running:
+            logger.info("Starting callback server...")
+            self.callback_thread = threading.Thread(target=self._start_callback_server)
+            self.callback_thread.daemon = True
+            self.callback_thread.start()
+            time.sleep(1)  # Give callback server time to start
+            self.callback_server_running = True
+            logger.info("Callback server started successfully")
+        else:
+            logger.info("Callback server already running")
 
     async def run_async(self, audio_file_path: str, metadata: Dict[str, Any] = None):
         """Main client execution (async version)"""
@@ -71,11 +111,8 @@ class TusClient:
         logger.info(f"Audio file: {audio_file_path}")
         logger.info(f"File size: {audio_path.stat().st_size} bytes")
 
-        # Start callback listener in background
-        callback_thread = threading.Thread(target=self._start_callback_server)
-        callback_thread.daemon = True
-        callback_thread.start()
-        time.sleep(0.5)  # Give callback server time to start
+        # Ensure callback server is running
+        self._ensure_callback_server()
 
         try:
             # Execute upload and wait for results
@@ -87,8 +124,6 @@ class TusClient:
         except Exception as e:
             logger.error(f"Client execution failed: {e}")
             raise
-        finally:
-            self.running = False
 
     def run(self, audio_file_path: str, metadata: Dict[str, Any] = None):
         """Main client execution (sync wrapper)"""
@@ -103,6 +138,75 @@ class TusClient:
         except RuntimeError:
             # Create new event loop
             return asyncio.run(self.run_async(audio_file_path, metadata))
+
+    async def run_multiple_async(self, audio_files: list, metadata_list: list = None):
+        """Process multiple audio files concurrently"""
+        if metadata_list is None:
+            metadata_list = [{}] * len(audio_files)
+
+        if len(audio_files) != len(metadata_list):
+            raise ValueError("Number of audio files must match number of metadata entries")
+
+        logger.info(f"Starting processing of {len(audio_files)} audio files")
+
+        # Ensure callback server is running
+        self._ensure_callback_server()
+
+        # Create tasks for all files
+        tasks = []
+        for i, audio_file in enumerate(audio_files):
+            task = asyncio.create_task(self._process_audio_file(audio_file, metadata_list[i]))
+            tasks.append(task)
+            logger.info(f"Queued task for file {i+1}/{len(audio_files)}: {audio_file}")
+
+        try:
+            # Wait for all tasks to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Process results
+            successful_results = []
+            failed_results = []
+
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"File {i+1} ({audio_files[i]}) failed: {result}")
+                    failed_results.append((audio_files[i], result))
+                else:
+                    logger.info(f"File {i+1} ({audio_files[i]}) completed successfully")
+                    successful_results.append((audio_files[i], result))
+
+            logger.info(f"Processing complete: {len(successful_results)} successful, {len(failed_results)} failed")
+
+            return {
+                'successful': successful_results,
+                'failed': failed_results,
+                'total': len(audio_files)
+            }
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+            # Cancel all pending tasks
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            raise
+        except Exception as e:
+            logger.error(f"Multi-file processing failed: {e}")
+            raise
+
+    def run_multiple(self, audio_files: list, metadata_list: list = None):
+        """Process multiple audio files concurrently (sync wrapper)"""
+        try:
+            # Try to run in existing event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                raise RuntimeError("Cannot use asyncio.run() in running event loop")
+            else:
+                # Use existing loop
+                return loop.run_until_complete(self.run_multiple_async(audio_files, metadata_list))
+        except RuntimeError:
+            # Create new event loop
+            return asyncio.run(self.run_multiple_async(audio_files, metadata_list))
 
     async def _process_audio_file(self, audio_file_path: str, metadata: Dict[str, Any]) -> str:
         """Process an audio file through the system"""
@@ -302,6 +406,10 @@ class TusClient:
         logger.info(f"Waiting for results on task {task_id} (timeout: {timeout_seconds}s)")
         logger.info(f"Current completed_tasks keys before adding: {list(self.completed_tasks.keys())}")
 
+        # Log callback failure simulation settings
+        if self.simulate_callback_failure:
+            logger.info(f"🚨 SIMULATION: Will stop callback server for {self.callback_failure_duration}s after upload completes")
+
         # Create a future for callback
         callback_future = asyncio.Future()
 
@@ -314,6 +422,14 @@ class TusClient:
 
                 received_task_id = payload.get('task_id')
                 logger.info(f"Received task_id: {received_task_id}, expected task_id: {task_id}")
+
+                # Check if we're simulating callback failure
+                logger.info(f"DEBUG: simulate_callback_failure={self.simulate_callback_failure}, callback_server_stopped={self.callback_server_stopped}")
+                if self.simulate_callback_failure and not self.callback_server_stopped:
+                    logger.warning(f"🚨 SIMULATION: Stopping callback server now for {self.callback_failure_duration}s")
+                    self.callback_server_stopped = True
+                    self.callback_failure_start_time = time.time()
+                    return web.Response(status=503, text="Callback server temporarily unavailable - simulation")
 
                 if received_task_id == task_id:
                     logger.info(f"✅ Received callback for task {task_id}")
@@ -358,6 +474,14 @@ class TusClient:
                 # Check if interrupted
                 if not self.running:
                     raise KeyboardInterrupt("User requested shutdown")
+
+                # Check if callback failure simulation should end
+                if self.simulate_callback_failure and self.callback_server_stopped:
+                    elapsed = time.time() - self.callback_failure_start_time
+                    if elapsed >= self.callback_failure_duration:
+                        logger.info(f"🔄 SIMULATION: Restarting callback server after {elapsed:.1f}s")
+                        self.callback_server_stopped = False
+                        self.callback_failure_start_time = None
 
                 # Check if callback is done
                 if callback_future.done():
@@ -480,6 +604,14 @@ class TusClient:
                 logger.info(f"Processing callback for task_id: {task_id}")
                 logger.info(f"Current completed_tasks keys: {list(self.completed_tasks.keys())}")
 
+                # Check if we're simulating callback failure
+                logger.info(f"DEBUG (server): simulate_callback_failure={self.simulate_callback_failure}, callback_server_stopped={self.callback_server_stopped}")
+                if self.simulate_callback_failure and not self.callback_server_stopped:
+                    logger.warning(f"🚨 SIMULATION (server): Stopping callback server now for {self.callback_failure_duration}s")
+                    self.callback_server_stopped = True
+                    self.callback_failure_start_time = time.time()
+                    return web.Response(status=503, text="Callback server temporarily unavailable - simulation")
+
                 if task_id in self.completed_tasks:
                     logger.info(f"Found task {task_id} in completed_tasks")
                     future = self.completed_tasks[task_id]
@@ -557,17 +689,40 @@ def main():
     )
 
     parser = argparse.ArgumentParser(description='TUS ASR Client')
-    parser.add_argument('file', help='Audio file to process')
+    parser.add_argument('files', nargs='+', help='Audio file(s) to process (can specify multiple files)')
+    parser.add_argument('--count', type=int, default=1, help='Number of times to process each file (useful for testing multiple requests)')
     parser.add_argument('--api-url', default='http://localhost:8000', help='API server URL')
     parser.add_argument('--tus-url', default='http://localhost:1080', help='TUS server URL')
     parser.add_argument('--callback-port', type=int, default=9090, help='Callback listener port')
     parser.add_argument('--callback-host', default='auto', help='Callback host IP (use "auto" for auto-detection, "localhost" for local testing)')
-    parser.add_argument('--api-key', help='API key for authentication')
+    parser.add_argument('--api-key', help='API key for authentication (overrides .env file)')
     parser.add_argument('--language', default='auto', help='Audio language')
     parser.add_argument('--model', default='large-v3-turbo', help='Whisper model')
-    parser.add_argument('--output', help='Output file for SRT content')
+    parser.add_argument('--output', help='Output file for SRT content (for single file only)')
+    parser.add_argument('--output-dir', help='Output directory for multiple SRT files (for multiple files)')
+    parser.add_argument('--simulate-callback-failure', action='store_true', help='Simulate callback failure by stopping callback server temporarily')
+    parser.add_argument('--callback-failure-duration', type=int, default=60, help='Duration in seconds to simulate callback failure')
+    parser.add_argument('--sequential', action='store_true', help='Process files sequentially instead of concurrently')
 
     args = parser.parse_args()
+
+    # Validate count parameter
+    if args.count < 1:
+        logger.error("Count must be at least 1")
+        sys.exit(1)
+
+    # Validate files exist
+    for file_path in args.files:
+        if not Path(file_path).exists():
+            logger.error(f"Audio file not found: {file_path}")
+            sys.exit(1)
+
+    # Create file list with count repetition
+    expanded_files = []
+    for file_path in args.files:
+        expanded_files.extend([file_path] * args.count)
+
+    logger.info(f"Processing {len(args.files)} unique file(s) {args.count} time(s) each = {len(expanded_files)} total requests")
 
     # Create and run client
     client = TusClient(
@@ -575,29 +730,138 @@ def main():
         tus_url=args.tus_url,
         callback_listener_port=args.callback_port,
         callback_host=args.callback_host,
-        api_key=args.api_key
+        api_key=args.api_key,  # Will be auto-detected from .env if None
+        simulate_callback_failure=args.simulate_callback_failure,
+        callback_failure_duration=args.callback_failure_duration
     )
 
+    # Log API key status (for debugging)
+    if client.api_key:
+        logger.info(f"Using API key: {'*' * 8}{client.api_key[-8:] if len(client.api_key) > 8 else client.api_key}")
+    else:
+        logger.warning("No API key configured - services may reject requests")
+
+    # Create metadata for each file (same metadata for all files)
     metadata = {
         'language': args.language,
         'model': args.model
     }
 
+    metadata_list = [metadata.copy() for _ in expanded_files]
+
     try:
-        # Run client - this will handle event loop properly
-        srt_content = client.run(args.file, metadata)
+        if len(expanded_files) == 1:
+            # Single file processing (or single request)
+            logger.info("Processing single request...")
+            srt_content = client.run(expanded_files[0], metadata)
 
-        if args.output:
-            with open(args.output, 'w', encoding='utf-8') as f:
-                f.write(srt_content)
-            logger.info(f"SRT content saved to {args.output}")
+            if args.output:
+                with open(args.output, 'w', encoding='utf-8') as f:
+                    f.write(srt_content)
+                logger.info(f"SRT content saved to {args.output}")
+            else:
+                print("\n" + "="*50)
+                print("SRT TRANSCRIPTION RESULT:")
+                print("="*50)
+                print(srt_content)
+                print("="*50)
+
         else:
-            print("\n" + "="*50)
-            print("SRT TRANSCRIPTION RESULT:")
-            print("="*50)
-            print(srt_content)
-            print("="*50)
+            # Multiple file/request processing
+            logger.info(f"Processing {len(expanded_files)} requests {'sequentially' if args.sequential else 'concurrently'}...")
 
+            if args.sequential:
+                # Process files sequentially
+                results = {'successful': [], 'failed': [], 'total': len(expanded_files)}
+                for i, file_path in enumerate(expanded_files):
+                    try:
+                        logger.info(f"Processing request {i+1}/{len(expanded_files)}: {file_path}")
+                        srt_content = client.run(file_path, metadata_list[i])
+                        results['successful'].append((f"{file_path} (#{i//args.count + 1})", srt_content))
+                        logger.info(f"✅ Request {i+1} completed successfully")
+                    except Exception as e:
+                        logger.error(f"❌ Request {i+1} failed: {e}")
+                        results['failed'].append((f"{file_path} (#{i//args.count + 1})", e))
+            else:
+                # Process files concurrently
+                results = client.run_multiple(expanded_files, metadata_list)
+
+                # Enhance results with request numbering for clarity
+                enhanced_successful = []
+                enhanced_failed = []
+
+                # Process successful results
+                for i, (file_path, srt_content) in enumerate(results['successful']):
+                    request_num = i // args.count + 1
+                    file_with_num = f"{file_path} (#{request_num})"
+                    enhanced_successful.append((file_with_num, srt_content))
+
+                # Process failed results
+                for i, (file_path, error) in enumerate(results['failed']):
+                    request_num = i // args.count + 1
+                    file_with_num = f"{file_path} (#{request_num})"
+                    enhanced_failed.append((file_with_num, error))
+
+                results['successful'] = enhanced_successful
+                results['failed'] = enhanced_failed
+
+            # Handle output for multiple files
+            if args.output_dir:
+                output_dir = Path(args.output_dir)
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+                for file_path, srt_content in results['successful']:
+                    input_path = Path(file_path)
+
+                    # Extract base filename (remove request number suffix if present)
+                    base_name = input_path.stem
+                    if " (#" in base_name:
+                        base_name = base_name.split(" (#")[0]
+
+                    # Create unique filename by adding request number if needed
+                    if args.count > 1:
+                        # Extract request number from the display name
+                        if " (#" in file_path:
+                            request_num = file_path.split(" (#")[1].rstrip(")")
+                            output_file = output_dir / f"{base_name}_request_{request_num}.srt"
+                        else:
+                            # Fallback: use counter
+                            counter = sum(1 for f in output_dir.glob(f"{base_name}_request_*.srt")) + 1
+                            output_file = output_dir / f"{base_name}_request_{counter}.srt"
+                    else:
+                        output_file = output_dir / f"{base_name}.srt"
+
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        f.write(srt_content)
+                    logger.info(f"Saved: {output_file}")
+
+            # Print summary
+            print("\n" + "="*60)
+            print("MULTI-FILE PROCESSING SUMMARY:")
+            print("="*60)
+            print(f"Total files: {results['total']}")
+            print(f"✅ Successful: {len(results['successful'])}")
+            print(f"❌ Failed: {len(results['failed'])}")
+
+            if results['successful']:
+                print("\nSuccessful files:")
+                for file_path, _ in results['successful']:
+                    print(f"  ✅ {file_path}")
+
+            if results['failed']:
+                print("\nFailed files:")
+                for file_path, error in results['failed']:
+                    print(f"  ❌ {file_path}: {error}")
+
+            print("="*60)
+
+            # Exit with error code if any files failed
+            if results['failed']:
+                sys.exit(1)
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Client failed: {e}")
         sys.exit(1)

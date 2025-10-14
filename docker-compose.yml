@@ -70,42 +70,29 @@ services:
       timeout: 10s
       retries: 3
 
-  # # Event Handler - Bridges Tus server and ASR workers
-  # event-handler:
-  #   build:
-  #     context: .
-  #     dockerfile: docker/Dockerfile.event
-  #   container_name: event-handler
-  #   environment:
-  #     - REDIS_URL=redis://redis:6379
-  #     - DATABASE_PATH=/data/tus_uploads.db
-  #     - DATA_DIR=/data
-  #     - POLL_INTERVAL=5
-  #     - MAX_RETRY_ATTEMPTS=3
-  #   volumes:
-  #     - ./data:/data
-  #     - ./logs:/logs
-  #   depends_on:
-  #     - redis
-  #   restart: unless-stopped
-
-  # # Callback Service - Handles HTTP callbacks
-  # callback-service:
-  #   build:
-  #     context: .
-  #     dockerfile: docker/Dockerfile.callback
-  #   container_name: callback-service
-  #   environment:
-  #     - REDIS_URL=redis://redis:6379
-  #     - CALLBACK_MAX_ATTEMPTS=3
-  #     - CALLBACK_RETRY_DELAY=10
-  #     - CALLBACK_TIMEOUT=30
-  #     - CALLBACK_CONCURRENCY=10
-  #   volumes:
-  #     - ./logs:/logs
-  #   depends_on:
-  #     - redis
-  #   restart: unless-stopped
+  # Callback Service - Handles HTTP callbacks
+  callback-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.callback
+    container_name: callback-service
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - CALLBACK_MAX_ATTEMPTS=3
+      - CALLBACK_RETRY_DELAY=10
+      - CALLBACK_TIMEOUT=30
+      - CALLBACK_CONCURRENCY=10
+    volumes:
+      - ./logs:/logs
+      - ./:/app  # Map entire source code directory to enable live code updates
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; r=redis.Redis(host='redis', port=6379); r.ping()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # Dynamic GPU Services with Load Balancer
   faster-whisper-dynamic:

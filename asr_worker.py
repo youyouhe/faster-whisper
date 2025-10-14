@@ -161,12 +161,20 @@ class ASRWorker:
                 if success:
                     # Publish completion message
                     srt_url = f"/api/v1/tasks/{task_id}/download"
-                    self.message_queue.publish_asr_completed(
+                    logger.info(f"DEBUG: Publishing ASR completion - task_id={task_id}, srt_file_path={str(srt_file_path)}, processing_time={processing_time:.1f}s")
+                    logger.info(f"DEBUG: SRT content length for callback: {len(srt_content)} characters")
+
+                    publish_success = self.message_queue.publish_asr_completed(
                         task_id=task_id,
                         srt_file_path=str(srt_file_path),
                         processing_time=processing_time,
                         srt_url=srt_url
                     )
+
+                    if publish_success:
+                        logger.info(f"DEBUG: Successfully published ASR completion message for task {task_id}")
+                    else:
+                        logger.error(f"DEBUG: Failed to publish ASR completion message for task {task_id}")
 
                     self.processed_count += 1
                     logger.info(

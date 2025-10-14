@@ -244,9 +244,26 @@ class MessageQueue:
                         # Call all registered callbacks
                         for callback in self.subscribers.get(queue_name, []):
                             try:
-                                callback(queue_message)
+                                # Check if callback is async
+                                if asyncio.iscoroutinefunction(callback):
+                                    # For async callbacks, create a new event loop or use existing one
+                                    try:
+                                        loop = asyncio.get_event_loop()
+                                        if loop.is_running():
+                                            # If loop is running, create a new task
+                                            asyncio.create_task(callback(queue_message))
+                                        else:
+                                            # If loop is not running, run the coroutine
+                                            loop.run_until_complete(callback(queue_message))
+                                    except RuntimeError:
+                                        # No event loop, create a new one
+                                        asyncio.run(callback(queue_message))
+                                else:
+                                    # For sync callbacks, call directly
+                                    callback(queue_message)
                             except Exception as e:
                                 logger.error(f"Error in callback for {queue_name}: {e}")
+                                logger.exception(e)  # Log full traceback
 
                     except Exception as e:
                         logger.error(f"Error processing message from {queue_name}: {e}")

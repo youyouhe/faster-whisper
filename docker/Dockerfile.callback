@@ -15,10 +15,10 @@ RUN pip install --no-cache-dir \
     aiohttp-cors
 
 # Copy required files
-COPY callback_service.py tus_api_server.py task_model.py message_queue.py distributed_processor.py ./
+COPY callback_service.py task_model.py message_queue.py ./
 
 # Setup
 RUN mkdir -p /logs
 ENV PYTHONPATH=/app PYTHONUNBUFFERED=1
 
-CMD ["python", "-m", "asyncio", "run", "callback_service.py"]
+CMD ["python", "callback_service.py"]
