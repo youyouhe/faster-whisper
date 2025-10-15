@@ -247,6 +247,7 @@ class WorkerProcess:
         """实际音频转写"""
         task_id = task.get('task_id')
         task_data = task.get('task_data', {})
+        response_format = task_data.get('response_format', 'json')
 
         try:
             # 从共享内存读取音频数据
@@ -256,7 +257,7 @@ class WorkerProcess:
                 raise Exception("Failed to read audio data from shared memory")
 
             # 使用Whisper进行转写
-            logger.info(f"Worker {self.worker_id} transcribing audio for task {task_id}")
+            logger.info(f"Worker {self.worker_id} transcribing audio for task {task_id} (format: {response_format})")
 
             # 创建临时文件
             import tempfile
@@ -276,38 +277,12 @@ class WorkerProcess:
                     word_timestamps=True
                 )
 
-                # 收集结果
-                result_segments = []
-                full_text = ""
-
-                for segment in segments:
-                    segment_data = {
-                        'start': segment.start,
-                        'end': segment.end,
-                        'text': segment.text.strip()
-                    }
-
-                    # 添加词级别时间戳
-                    if hasattr(segment, 'words') and segment.words:
-                        segment_data['words'] = [
-                            {
-                                'start': word.start,
-                                'end': word.end,
-                                'word': word.word,
-                                'probability': word.probability
-                            } for word in segment.words
-                        ]
-
-                    result_segments.append(segment_data)
-                    full_text += segment.text + " "
-
-                result = {
-                    'text': full_text.strip(),
-                    'segments': result_segments,
-                    'language': info.language if hasattr(info, 'language') else 'en',
-                    'language_probability': getattr(info, 'language_probability', 1.0),
-                    'detected_language': getattr(info, 'language', 'en')
-                }
+                # 根据response_format生成不同格式的结果
+                if response_format == 'srt':
+                    result = self._generate_srt_result(segments, info)
+                else:
+                    # 默认JSON格式
+                    result = self._generate_json_result(segments, info)
 
                 logger.info(f"Worker {self.worker_id} transcription completed for task {task_id}")
                 return result
@@ -322,6 +297,119 @@ class WorkerProcess:
         except Exception as e:
             logger.error(f"Worker {self.worker_id} transcription failed for task {task_id}: {e}")
             raise
+
+    def _generate_json_result(self, segments, info) -> Dict[str, Any]:
+        """生成JSON格式结果"""
+        # 收集结果
+        result_segments = []
+        full_text = ""
+
+        for segment in segments:
+            segment_data = {
+                'start': segment.start,
+                'end': segment.end,
+                'text': segment.text.strip()
+            }
+
+            # 添加词级别时间戳
+            if hasattr(segment, 'words') and segment.words:
+                segment_data['words'] = [
+                    {
+                        'start': word.start,
+                        'end': word.end,
+                        'word': word.word,
+                        'probability': word.probability
+                    } for word in segment.words
+                ]
+
+            result_segments.append(segment_data)
+            full_text += segment.text + " "
+
+        result = {
+            'text': full_text.strip(),
+            'segments': result_segments,
+            'language': info.language if hasattr(info, 'language') else 'en',
+            'language_probability': getattr(info, 'language_probability', 1.0),
+            'detected_language': getattr(info, 'language', 'en')
+        }
+
+        return result
+
+    def _generate_srt_result(self, segments, info) -> Dict[str, Any]:
+        """生成SRT格式结果"""
+        try:
+            # 生成SRT内容
+            srt_lines = []
+            segment_index = 1
+
+            # 清理文本函数
+            def clean_text(text):
+                if not text:
+                    return text
+                # 移除多余的标点符号空格
+                import re
+                text = re.sub(r'\s+([,.!?;:，。！？；：])', r'\1', text)
+                # 移除中文字符和标点之间的空格
+                text = re.sub(r'([^\s])\s+([,.!?;:，。！？；：])', r'\1\2', text)
+                # 移除多个连续空格
+                text = re.sub(r'\s+', ' ', text)
+                # 去除首尾空白
+                text = text.strip()
+                return text
+
+            # 时间戳格式化函数
+            def format_timestamp_srt(seconds):
+                """将秒转换为SRT时间戳格式 (HH:MM:SS,mmm)"""
+                hours = int(seconds // 3600)
+                minutes = int((seconds % 3600) // 60)
+                secs = int(seconds % 60)
+                millis = int((seconds % 1) * 1000)
+
+                return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+            # 处理每个segment
+            for segment in segments:
+                if segment.text.strip():
+                    # 清理文本
+                    cleaned_text = clean_text(segment.text)
+
+                    if cleaned_text.strip():  # 只添加非空段落
+                        # 添加段落编号
+                        srt_lines.append(str(segment_index))
+
+                        # 添加时间戳
+                        srt_lines.append(f"{format_timestamp_srt(segment.start)} --> {format_timestamp_srt(segment.end)}")
+
+                        # 添加文本内容
+                        srt_lines.append(cleaned_text)
+
+                        # 添加空行
+                        srt_lines.append("")
+                        segment_index += 1
+
+            # 合并所有行为SRT内容
+            srt_content = "\n".join(srt_lines).strip()
+
+            # 清理BOM和无效字符
+            if srt_content.startswith('\ufeff'):
+                srt_content = srt_content[1:]
+
+            result = {
+                'text': srt_content,
+                'format': 'srt',
+                'language': info.language if hasattr(info, 'language') else 'en',
+                'language_probability': getattr(info, 'language_probability', 1.0),
+                'detected_language': getattr(info, 'language', 'en'),
+                'segments_count': segment_index - 1
+            }
+
+            logger.info(f"Worker {self.worker_id} generated SRT with {segment_index - 1} segments")
+            return result
+
+        except Exception as e:
+            logger.error(f"Worker {self.worker_id} SRT generation failed: {e}")
+            # 如果SRT生成失败，返回JSON格式
+            return self._generate_json_result(segments, info)
 
     def _read_audio_from_shared_memory(self, task: Dict[str, Any]) -> Optional[bytes]:
         """从共享内存读取音频数据"""

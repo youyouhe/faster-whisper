@@ -168,9 +168,9 @@ class UnifiedAPI:
                 task_data = {
                     'client_id': f"api_client_{int(time.time())}",
                     'audio_size': len(file_content),
+                    'response_format': response_format,  # 直接放在task_data中，方便worker访问
                     'metadata': {
                         'language': language,
-                        'response_format': response_format,
                         'temperature': temperature,
                         'beam_size': beam_size,
                         'original_filename': file.filename,
@@ -251,9 +251,9 @@ class UnifiedAPI:
                 task_data = {
                     'client_id': f"api_async_client_{int(time.time())}",
                     'audio_size': len(file_content),
+                    'response_format': response_format,  # 直接放在task_data中，方便worker访问
                     'metadata': {
                         'language': language,
-                        'response_format': response_format,
                         'original_filename': file.filename,
                         'content_type': file.content_type,
                         'callback_url': callback_url,
