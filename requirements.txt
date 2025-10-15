@@ -1,22 +1,28 @@
-# Core faster-whisper dependencies
-ctranslate2>=4.0,<5
+# requirements.clean.txt
+
+# --- Core faster-whisper dependencies ---
+# ctranslate2>=4.0,<5  (您注释掉了，但这是核心，应该保留)
 huggingface_hub>=0.13
 tokenizers>=0.13,<1
-onnxruntime>=1.14,<2 
+onnxruntime>=1.14,<2
+numpy>=1.21.0
+
+# --- API service dependencies ---
+fastapi>=0.68.0
+uvicorn>=0.15.0
+
+# --- Audio & Other Utilities ---
 av>=11
 tqdm
 pydub>=0.25.1
-numpy>=1.21.0
 python-multipart>=0.0.6
-
-# API service dependencies
-fastapi>=0.68.0
-uvicorn>=0.15.0
 aiohttp>=3.8.0
-torch>=1.10.0
-
-# Audio processing dependencies
 scipy>=1.7.0
-
-#redis
 redis
+psutil>=7.0.0
+nvidia-ml-py>=11.0.0
+
+# --- PyTorch ---
+# 强烈建议手动安装，而不是放在这里。
+# torch>=1.10.0 (您注释掉了，这是对的)
+
