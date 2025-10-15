@@ -94,7 +94,7 @@ services:
       timeout: 10s
       retries: 3
 
-  # Dynamic GPU Services with Load Balancer
+  # Dynamic GPU Services with Load Balancer - Multi-Instance per GPU
   faster-whisper-dynamic:
     build:
       context: .
@@ -103,18 +103,25 @@ services:
     container_name: faster-whisper-dynamic
     ports:
       - "5001:5001"  # Load balancer
-      - "5002:5002"  # GPU service 0
-      - "5003:5003"  # GPU service 1
-      - "5004:5004"  # GPU service 2
-      - "5005:5005"  # GPU service 3
-      - "5006:5006"  # GPU service 4
-      - "5007:5007"  # GPU service 5
-      - "5008:5008"  # GPU service 6
+      # Multi-instance ports (2 instances per GPU for up to 3 GPUs)
+      - "5002:5002"  # GPU 0 Instance 0
+      - "5003:5003"  # GPU 0 Instance 1
+      - "5004:5004"  # GPU 1 Instance 0
+      - "5005:5005"  # GPU 1 Instance 1
+      - "5006:5006"  # GPU 2 Instance 0
+      - "5007:5007"  # GPU 2 Instance 1
+      # Additional ports for more GPUs if needed
+      - "5008:5008"  # GPU 3 Instance 0
+      - "5009:5009"  # GPU 3 Instance 1
+      - "5010:5010"  # GPU 4 Instance 0
+      - "5011:5011"  # GPU 4 Instance 1
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - DATABASE_PATH=/data/tus_uploads.db
       - DATA_DIR=/data
       - API_KEY=${API_KEY:-your-secret-api-key-here}
+      - INSTANCES_PER_GPU=2  # 每GPU启动2个实例
+      - STARTUP_MODE=multi_instance  # 使用多实例启动模式
     deploy:
       resources:
         reservations:

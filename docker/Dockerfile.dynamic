@@ -23,8 +23,8 @@ WORKDIR /app
 # Copy project files (use custom dockerignore to ensure README.md is included)
 COPY --chown=root:root . .
 
-# Make sure the start script is executable
-RUN chmod +x /app/start_dynamic_services.sh
+# Make sure the start scripts are executable
+RUN chmod +x /app/start_dynamic_services.sh /app/start_multi_instance_per_gpu.sh
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --no-deps -e . && \
@@ -33,12 +33,12 @@ RUN pip install --no-cache-dir --no-deps -e . && \
 # Note: Model download is handled at runtime to avoid build-time network issues
 # Models will be downloaded when the service first starts
 
-# Expose ports for load balancer and multiple GPU services
-EXPOSE 5001 5002 5003 5004 5005 5006 5007 5008
+# Expose ports for load balancer and multiple GPU services (multi-instance per GPU)
+EXPOSE 5001 5002 5003 5004 5005 5006 5007 5008 5009 5010 5011
 
 # Health check for the main container
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5001/health || exit 1
 
-# Start dynamic services
-CMD ["/app/start_dynamic_services.sh"]
+# Start dynamic services with multi-instance support
+CMD ["/bin/bash", "-c", "if [ \"$STARTUP_MODE\" = \"multi_instance\" ]; then /app/start_multi_instance_per_gpu.sh; else /app/start_dynamic_services.sh; fi"]

@@ -73,6 +73,7 @@ class DistributedProcessor:
         self.srt_merger = SRTMerger()
         self.distributed_threshold_mb = int(os.getenv("DISTRIBUTED_THRESHOLD_MB", "10"))  # MB, configurable
         self.overlap_seconds = float(os.getenv("OVERLAP_SECONDS", "2.0"))  # seconds, configurable
+        self.min_chunk_size_mb = float(os.getenv("MIN_CHUNK_SIZE_MB", "1.0"))  # MB, minimum chunk size
 
     async def should_distribute(self, file_size_bytes: int, available_workers: int) -> bool:
         """
@@ -92,6 +93,37 @@ class DistributedProcessor:
         logger.info(f"Should distribute: {should_distribute}")
 
         return should_distribute
+
+    def calculate_optimal_chunks(self, file_size_mb: float, available_workers: int) -> int:
+        """
+        Calculate optimal number of chunks based on file size and constraints
+
+        Args:
+            file_size_mb: File size in MB
+            available_workers: Number of available workers
+
+        Returns:
+            Optimal number of chunks
+        """
+        # Calculate maximum chunks based on minimum chunk size
+        max_chunks_by_size = int(file_size_mb / self.min_chunk_size_mb)
+
+        # Calculate optimal chunks (prefer fewer chunks for better efficiency)
+        # Target 2-4 chunks per worker for good load balancing
+        target_chunks_per_worker = 2
+        target_chunks = available_workers * target_chunks_per_worker
+
+        # Choose the minimum of constraints, but at least 1
+        optimal_chunks = min(max_chunks_by_size, target_chunks, available_workers)
+
+        # Ensure at least 1 chunk and not more than available workers
+        optimal_chunks = max(1, min(optimal_chunks, available_workers))
+
+        logger.info(f"File size: {file_size_mb:.2f}MB, Min chunk size: {self.min_chunk_size_mb}MB")
+        logger.info(f"Max chunks by size: {max_chunks_by_size}, Target chunks: {target_chunks}, Available workers: {available_workers}")
+        logger.info(f"Optimal chunks: {optimal_chunks}")
+
+        return optimal_chunks
 
     async def process_distributed(
         self,
@@ -114,13 +146,7 @@ class DistributedProcessor:
         """
         logger.info(f"Starting distributed processing with {len(available_backends)} workers")
 
-        # Determine number of workers to use
-        num_workers = min(len(available_backends), 4)  # Max 4 workers for now
-        workers_to_use = available_backends[:num_workers]
-
-        logger.info(f"Using {num_workers} workers: {workers_to_use}")
-
-        # Extract audio data from multipart request body
+        # Extract audio data from multipart request body first
         try:
             # Extract boundary from Content-Type header
             content_type = headers.get('Content-Type', '')
@@ -140,6 +166,18 @@ class DistributedProcessor:
         except Exception as e:
             logger.error(f"Failed to extract audio from multipart data: {e}")
             raise RuntimeError(f"Audio extraction failed: {e}")
+
+        # Calculate optimal chunk count based on file size and constraints
+        file_size_mb = len(audio_data) / (1024 * 1024)
+        optimal_chunks = self.calculate_optimal_chunks(file_size_mb, len(available_backends))
+
+        # Determine number of workers to use (use calculated optimal chunks)
+        # Use all available workers, but limit to reasonable number to avoid fragmentation
+        max_workers = int(os.getenv("MAX_DISTRIBUTED_WORKERS", str(len(available_backends))))
+        num_workers = min(optimal_chunks, len(available_backends), max_workers)
+        workers_to_use = available_backends[:num_workers]
+
+        logger.info(f"Using {num_workers} workers: {workers_to_use}")
 
         # Split audio file
         try:
@@ -326,6 +364,7 @@ class DistributedProcessor:
         """Get processing statistics"""
         return {
             "distributed_threshold_mb": self.distributed_threshold_mb,
+            "min_chunk_size_mb": self.min_chunk_size_mb,
             "overlap_seconds": self.overlap_seconds,
-            "max_workers": 4
+            "max_workers": os.getenv("MAX_DISTRIBUTED_WORKERS", "auto")
         }

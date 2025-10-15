@@ -27,6 +27,157 @@ import numpy as np
 # Import authentication middleware
 from auth_middleware import get_auth, require_auth
 
+# Statistics tracking
+from dataclasses import dataclass, field
+from typing import Dict, Any
+import threading
+import json
+
+@dataclass
+class ProcessingStats:
+    """处理统计数据类"""
+    # 基本统计
+    total_requests: int = 0
+    successful_requests: int = 0
+    failed_requests: int = 0
+
+    # 文件处理统计
+    total_files_processed: int = 0
+    total_file_size_mb: float = 0.0
+    total_chunks_processed: int = 0
+
+    # 时间统计
+    total_processing_time: float = 0.0
+    total_upload_time: float = 0.0
+
+    # 性能统计
+    average_processing_speed: float = 0.0  # MB/s
+    peak_memory_usage: float = 0.0
+
+    # Chunk详细统计
+    chunk_stats: Dict[str, Any] = field(default_factory=dict)
+
+    # 实例信息
+    instance_id: str = ""
+    gpu_device: str = ""
+    port: int = 0
+    start_time: float = field(default_factory=time.time)
+
+# 全局统计实例
+stats = ProcessingStats()
+stats_lock = threading.Lock()
+
+def update_stats(event_type: str, **kwargs):
+    """更新统计数据"""
+    global stats
+    with stats_lock:
+        if event_type == "request_start":
+            stats.total_requests += 1
+
+        elif event_type == "request_success":
+            stats.successful_requests += 1
+            if 'processing_time' in kwargs:
+                stats.total_processing_time += kwargs['processing_time']
+            if 'file_size_mb' in kwargs:
+                stats.total_file_size_mb += kwargs['file_size_mb']
+                stats.total_files_processed += 1
+
+        elif event_type == "request_failed":
+            stats.failed_requests += 1
+
+        elif event_type == "upload_complete":
+            if 'upload_time' in kwargs:
+                stats.total_upload_time += kwargs['upload_time']
+
+        elif event_type == "chunk_processed":
+            stats.total_chunks_processed += 1
+
+        elif event_type == "memory_usage":
+            if 'memory_mb' in kwargs:
+                stats.peak_memory_usage = max(stats.peak_memory_usage, kwargs['memory_mb'])
+
+        # 更新平均处理速度
+        if stats.total_files_processed > 0 and stats.total_processing_time > 0:
+            stats.average_processing_speed = stats.total_file_size_mb / (stats.total_processing_time / 3600)  # MB/hour
+
+def get_gpu_display_name() -> str:
+    """获取GPU设备的显示名称"""
+    if device == "cpu":
+        return "cpu"
+
+    # 尝试获取具体的GPU ID
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # 如果设置了CUDA_VISIBLE_DEVICES，显示可见的GPU ID
+            if 'CUDA_VISIBLE_DEVICES' in os.environ:
+                visible_devices = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
+                return f"cuda:{visible_devices[0]}" if visible_devices else "cuda"
+            else:
+                # 否则显示实际的GPU设备ID
+                gpu_id = os.getenv("GPU_DEVICE_ID", "0")
+                return f"cuda:{gpu_id}"
+    except:
+        pass
+
+    return device
+
+def get_instance_info() -> Dict[str, Any]:
+    """获取实例信息"""
+    return {
+        "instance_id": os.getenv("INSTANCE_ID", "default"),
+        "gpu_device": get_gpu_display_name(),
+        "port": int(os.getenv("API_PORT", "5001")),
+        "model_size": model_size,
+        "uptime_seconds": time.time() - stats.start_time
+    }
+
+def get_stats() -> Dict[str, Any]:
+    """获取统计数据"""
+    with stats_lock:
+        instance_info = get_instance_info()
+        uptime = time.time() - stats.start_time
+
+        # 计算成功率
+        success_rate = (stats.successful_requests / stats.total_requests * 100) if stats.total_requests > 0 else 0
+
+        # 计算平均处理时间
+        avg_processing_time = (stats.total_processing_time / stats.successful_requests) if stats.successful_requests > 0 else 0
+
+        # 计算吞吐量（请求/小时）
+        throughput = stats.total_requests / (uptime / 3600) if uptime > 0 else 0
+
+        return {
+            "instance_info": instance_info,
+            "uptime_seconds": uptime,
+            "request_stats": {
+                "total_requests": stats.total_requests,
+                "successful_requests": stats.successful_requests,
+                "failed_requests": stats.failed_requests,
+                "success_rate_percent": round(success_rate, 2),
+                "throughput_requests_per_hour": round(throughput, 2)
+            },
+            "file_stats": {
+                "total_files_processed": stats.total_files_processed,
+                "total_file_size_mb": round(stats.total_file_size_mb, 2),
+                "total_chunks_processed": stats.total_chunks_processed,
+                "average_file_size_mb": round(stats.total_file_size_mb / stats.total_files_processed, 2) if stats.total_files_processed > 0 else 0,
+                "average_chunks_per_file": round(stats.total_chunks_processed / stats.total_files_processed, 2) if stats.total_files_processed > 0 else 0
+            },
+            "performance_stats": {
+                "total_processing_time": round(stats.total_processing_time, 2),
+                "total_upload_time": round(stats.total_upload_time, 2),
+                "average_processing_time_seconds": round(avg_processing_time, 2),
+                "average_processing_speed_mb_per_hour": round(stats.average_processing_speed, 2),
+                "peak_memory_usage_mb": round(stats.peak_memory_usage, 2)
+            },
+            "current_status": {
+                "queue_length": len(task_queue),
+                "currently_processing": current_processing_tasks,
+                "max_concurrent_tasks": max_concurrent_tasks
+            }
+        }
+
 # Simplified middleware - only add necessary headers without touching response body
 class SimpleResponseMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -516,7 +667,7 @@ def transcribe_to_srt(file_path: str, language: str = "auto", max_words_per_segm
 @app.on_event("startup")
 async def startup_event():
     """Initialize model on startup"""
-    global model
+    global model, stats
     print(f"Initializing {model_size} model on device {device}...")
     import time
     model_init_start = time.time()
@@ -524,10 +675,25 @@ async def startup_event():
     model_init_time = time.time() - model_init_start
     print(f"Model initialized successfully in {model_init_time:.2f}s!")
 
+    # 初始化统计信息
+    instance_info = get_instance_info()
+    stats.instance_id = instance_info["instance_id"]
+    stats.gpu_device = instance_info["gpu_device"]
+    stats.port = instance_info["port"]
+    print(f"Instance {stats.instance_id} started on GPU {stats.gpu_device}, port {stats.port}")
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy"}
+
+@app.get("/stats")
+async def get_instance_stats():
+    """获取实例详细统计数据"""
+    return {
+        "status": "healthy",
+        "stats": get_stats()
+    }
 
 @app.get("/test-json")
 async def test_json_response():
@@ -547,6 +713,10 @@ async def inference(
     language: str = Form("auto")
 ):
     """ASR inference endpoint compatible with existing clients - 优化流式上传"""
+
+    # 记录请求开始
+    request_start_time = time.time()
+    update_stats("request_start")
 
     # Require API key authentication
     require_auth(request)
@@ -586,12 +756,16 @@ async def inference(
                     print(f"已接收: {total_size / (1024*1024):.1f}MB")
 
             upload_time = time.time() - upload_start
-            print(f"✅ 文件接收完成！大小: {total_size/(1024*1024):.2f}MB, 耗时: {upload_time:.2f}秒, 速度: {total_size/(upload_time*1024*1024):.2f}MB/s")
+            file_size_mb = total_size / (1024 * 1024)
+            print(f"✅ 文件接收完成！大小: {file_size_mb:.2f}MB, 耗时: {upload_time:.2f}秒, 速度: {total_size/(upload_time*1024*1024):.2f}MB/s")
+
+            # 更新上传统计
+            update_stats("upload_complete", upload_time=upload_time, file_size_mb=file_size_mb)
 
         # Add task to queue
         task_id = str(uuid.uuid4())
         future = asyncio.Future()
-        task_queue.append((task_id, temp_file_path, language, future))
+        task_queue.append((task_id, temp_file_path, language, future, request_start_time, file_size_mb))
         print(f"Task {task_id} added to queue. Queue size: {len(task_queue)}")
 
         # Process queue if not already processing
@@ -617,25 +791,24 @@ async def inference(
 async def process_queue():
     """Process tasks in the queue serially"""
     global current_processing_tasks
-    
+
     # Check if we're already processing the maximum number of tasks
     if current_processing_tasks >= max_concurrent_tasks:
         return
-    
+
     # Acquire lock to ensure thread safety
     async with processing_lock:
         # Check again after acquiring lock
         if current_processing_tasks >= max_concurrent_tasks or len(task_queue) == 0:
             return
-            
+
         # Get the next task from the queue
-        task_id, temp_file_path, language, future = task_queue.popleft()
+        task_id, temp_file_path, language, future, request_start_time, file_size_mb = task_queue.popleft()
         current_processing_tasks += 1
         print(f"Starting processing of task {task_id}. Remaining queue size: {len(task_queue)}")
     
     try:
-        # Check if file needs to be split
-        file_size_mb = os.path.getsize(temp_file_path) / (1024 * 1024)
+        # Check if file needs to split (file_size_mb is now passed from queue item)
         if file_size_mb > MAX_FILE_SIZE:
             # Split large file into chunks
             print(f"File {os.path.basename(temp_file_path)} is {file_size_mb:.2f}MB, splitting into chunks...")
@@ -661,7 +834,10 @@ async def process_queue():
                     # Process chunk with individual chunk timeout
                     chunk_srt = transcribe_to_srt(chunk_file, language, timeout=CHUNK_TIMEOUT)
                     srt_results.append(chunk_srt)
-                    
+
+                    # 更新 chunk 统计
+                    update_stats("chunk_processed")
+
                     chunk_time = time.time() - chunk_start
                     print(f"Chunk {i+1} processed in {chunk_time:.2f}s")
                 
@@ -687,10 +863,14 @@ async def process_queue():
             else:
                 # File doesn't need splitting or splitting failed
                 srt_content = transcribe_to_srt(temp_file_path, language, timeout=CHUNK_TIMEOUT)
+                # 对于不分块的文件，也算作1个chunk
+                update_stats("chunk_processed")
         else:
             # File is small enough, process normally
             srt_content = transcribe_to_srt(temp_file_path, language, timeout=CHUNK_TIMEOUT)
-        
+            # 对于小文件，也算作1个chunk
+            update_stats("chunk_processed")
+
         # Process the transcription
         srt_start = time.time()
         print(f"Debug Info - Starting transcription process for {os.path.basename(temp_file_path)}")
@@ -810,9 +990,11 @@ async def process_queue():
         response_time = time.time() - response_start
         print(f"Debug Info - JSON response creation time: {response_time:.6f}s")
 
-        # Set the result
+        # Set the result and update success statistics
+        processing_time = time.time() - request_start_time
+        update_stats("request_success", processing_time=processing_time, file_size_mb=file_size_mb)
         future.set_result(response)
-        
+
     except Exception as e:
         print(f"ERROR: Exception in inference: {str(e)}")
         import traceback
@@ -826,6 +1008,9 @@ async def process_queue():
             },
             headers={"Content-Type": "application/json; charset=utf-8"}
         )
+
+        # 更新失败统计
+        update_stats("request_failed")
         future.set_result(error_response)
     
     finally:

@@ -18,6 +18,7 @@ from concurrent.futures import TimeoutError
 import subprocess
 import tempfile
 import re
+import time
 
 # Import distributed processing components
 from distributed_processor import DistributedProcessor
@@ -242,8 +243,33 @@ async def parse_multipart_data(data: bytes, boundary: str) -> bytes:
         logger.error(f"Error parsing multipart data: {e}")
         raise
 
-# Load backend services from environment variables
-BACKEND_SERVICES = os.getenv("BACKEND_SERVICES", "http://localhost:5002,http://localhost:5003,http://localhost:5004,http://localhost:5005").split(",") 
+def generate_backend_services():
+    """动态生成后端服务列表"""
+    try:
+        num_gpus = int(os.getenv("NUM_GPUS", "4"))
+        instances_per_gpu = int(os.getenv("INSTANCES_PER_GPU", "2"))
+        start_port = int(os.getenv("START_PORT", "5002"))
+
+        services = []
+        for gpu_id in range(num_gpus):
+            for instance in range(instances_per_gpu):
+                port = start_port + gpu_id * instances_per_gpu + instance
+                services.append(f"http://localhost:{port}")
+
+        logger.info(f"Generated {len(services)} backend services for {num_gpus} GPUs x {instances_per_gpu} instances: {services}")
+        return services
+    except Exception as e:
+        logger.error(f"Error generating backend services: {e}")
+        # 回退到默认配置
+        return ["http://localhost:5002", "http://localhost:5003", "http://localhost:5004", "http://localhost:5005"]
+
+# Load backend services from environment variables or generate dynamically
+BACKEND_SERVICES_ENV = os.getenv("BACKEND_SERVICES")
+if BACKEND_SERVICES_ENV:
+    BACKEND_SERVICES = BACKEND_SERVICES_ENV.split(",")
+    logger.info(f"Using BACKEND_SERVICES from environment: {BACKEND_SERVICES}")
+else:
+    BACKEND_SERVICES = generate_backend_services() 
 HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "30"))  # seconds
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))  # Maximum requests in queue
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "1800"))  # seconds (30 minutes for large audio files)
@@ -401,8 +427,8 @@ def get_healthy_backends() -> List[str]:
 
 def get_available_backends() -> List[str]:
     """Get list of currently available (healthy and not busy) backends"""
-    return [service for service, is_healthy in BACKEND_STATUS.items() 
-            if is_healthy and not BACKEND_BUSY.get(service[0], False)]
+    return [service for service, is_healthy in BACKEND_STATUS.items()
+            if is_healthy and not BACKEND_BUSY.get(service, False)]
 
 def get_idle_backend() -> Optional[str]:
     """Get an idle backend using round-robin algorithm"""
@@ -855,6 +881,157 @@ async def process_single_worker_request(request, request_body: bytes, available_
             raise
         raise web.HTTPInternalServerError(reason=f"Error processing queued request: {str(e)}")
 
+async def collect_backend_stats(service: str) -> Dict[str, Any]:
+    """收集单个后端实例的统计数据"""
+    try:
+        timeout = aiohttp.ClientTimeout(total=10, connect=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"{service}/stats") as response:
+                if response.status == 200:
+                    stats_data = await response.json()
+                    return {
+                        "service": service,
+                        "status": "healthy",
+                        "stats": stats_data.get("stats", {}),
+                        "last_updated": time.time()
+                    }
+                else:
+                    return {
+                        "service": service,
+                        "status": "error",
+                        "error": f"HTTP {response.status}",
+                        "last_updated": time.time()
+                    }
+    except Exception as e:
+        return {
+            "service": service,
+            "status": "error",
+            "error": str(e),
+            "last_updated": time.time()
+        }
+
+async def stats_handler(request):
+    """详细统计信息接口"""
+    # 收集所有后端实例的统计数据
+    backend_stats = []
+    if BACKEND_SERVICES:
+        # 并发收集所有后端统计数据
+        tasks = [collect_backend_stats(service) for service in BACKEND_SERVICES]
+        backend_stats = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 过滤异常结果
+        backend_stats = [stat for stat in backend_stats if isinstance(stat, dict)]
+
+    # 计算汇总统计
+    total_stats = {
+        "total_requests": 0,
+        "successful_requests": 0,
+        "failed_requests": 0,
+        "total_files_processed": 0,
+        "total_file_size_mb": 0.0,
+        "total_chunks_processed": 0,
+        "total_processing_time": 0.0,
+        "total_upload_time": 0.0,
+        "healthy_instances": 0,
+        "total_instances": len(BACKEND_SERVICES)
+    }
+
+    # 实例性能统计
+    instance_performance = []
+
+    for backend_stat in backend_stats:
+        if backend_stat.get("status") == "healthy" and "stats" in backend_stat:
+            stats = backend_stat["stats"]
+            instance_stats = stats.get("request_stats", {})
+            file_stats = stats.get("file_stats", {})
+            performance_stats = stats.get("performance_stats", {})
+            instance_info = stats.get("instance_info", {})
+
+            # 累加到总计
+            total_stats["total_requests"] += instance_stats.get("total_requests", 0)
+            total_stats["successful_requests"] += instance_stats.get("successful_requests", 0)
+            total_stats["failed_requests"] += instance_stats.get("failed_requests", 0)
+            total_stats["total_files_processed"] += file_stats.get("total_files_processed", 0)
+            total_stats["total_file_size_mb"] += file_stats.get("total_file_size_mb", 0)
+            total_stats["total_chunks_processed"] += file_stats.get("total_chunks_processed", 0)
+            total_stats["total_processing_time"] += performance_stats.get("total_processing_time", 0)
+            total_stats["total_upload_time"] += performance_stats.get("total_upload_time", 0)
+
+            if backend_stat.get("status") == "healthy":
+                total_stats["healthy_instances"] += 1
+
+            # 实例性能详情
+            instance_performance.append({
+                "instance_id": instance_info.get("instance_id", "unknown"),
+                "service": backend_stat["service"],
+                "port": instance_info.get("port", 0),
+                "gpu_device": instance_info.get("gpu_device", "unknown"),
+                "model_size": instance_info.get("model_size", "unknown"),
+                "uptime_seconds": instance_info.get("uptime_seconds", 0),
+                "request_stats": instance_stats,
+                "file_stats": file_stats,
+                "performance_stats": performance_stats,
+                "current_status": stats.get("current_status", {}),
+                "status": backend_stat.get("status", "unknown")
+            })
+
+    # 计算平均值和比率
+    total_success_rate = (total_stats["successful_requests"] / total_stats["total_requests"] * 100) if total_stats["total_requests"] > 0 else 0
+    avg_processing_time = (total_stats["total_processing_time"] / total_stats["successful_requests"]) if total_stats["successful_requests"] > 0 else 0
+    avg_file_size = (total_stats["total_file_size_mb"] / total_stats["total_files_processed"]) if total_stats["total_files_processed"] > 0 else 0
+    avg_chunks_per_file = (total_stats["total_chunks_processed"] / total_stats["total_files_processed"]) if total_stats["total_files_processed"] > 0 else 0
+
+    # 负载均衡器状态
+    healthy_backends = get_healthy_backends()
+    available_backends = [
+        service for service in BACKEND_STATUS.items()
+        if service[1] and not BACKEND_BUSY.get(service[0], False)
+    ]
+
+    # 分布式处理统计
+    distributed_stats = distributed_processor.get_processing_stats()
+
+    stats_response = {
+        "load_balancer": {
+            "status": "healthy" if healthy_backends else "degraded",
+            "healthy_backends": len(healthy_backends),
+            "available_backends": len(available_backends),
+            "total_backends": len(BACKEND_SERVICES),
+            "queue_length": len(REQUEST_QUEUE),
+            "max_queue_size": MAX_QUEUE_SIZE,
+            "active_requests": len(ACTIVE_REQUESTS)
+        },
+        "aggregated_stats": {
+            "total_requests": total_stats["total_requests"],
+            "successful_requests": total_stats["successful_requests"],
+            "failed_requests": total_stats["failed_requests"],
+            "success_rate_percent": round(total_success_rate, 2),
+            "total_files_processed": total_stats["total_files_processed"],
+            "total_file_size_mb": round(total_stats["total_file_size_mb"], 2),
+            "total_chunks_processed": total_stats["total_chunks_processed"],
+            "average_file_size_mb": round(avg_file_size, 2),
+            "average_chunks_per_file": round(avg_chunks_per_file, 2),
+            "total_processing_time_seconds": round(total_stats["total_processing_time"], 2),
+            "total_upload_time_seconds": round(total_stats["total_upload_time"], 2),
+            "average_processing_time_seconds": round(avg_processing_time, 2),
+            "healthy_instances": total_stats["healthy_instances"],
+            "total_instances": total_stats["total_instances"]
+        },
+        "instance_details": instance_performance,
+        "distributed_processing": distributed_stats,
+        "backend_status": {
+            service: {
+                "healthy": BACKEND_STATUS[service],
+                "busy": BACKEND_BUSY.get(service, False),
+                "active_request": ACTIVE_REQUESTS.get(service, {}).get('request_id') if service in ACTIVE_REQUESTS else None
+            }
+            for service in BACKEND_SERVICES
+        },
+        "timestamp": time.time()
+    }
+
+    return web.json_response(stats_response)
+
 async def health_handler(request):
     """Health check endpoint"""
     healthy_backends = get_healthy_backends()
@@ -916,21 +1093,23 @@ async def cleanup_background_tasks(app):
 def init_app():
     """Initialize application"""
     app = web.Application(client_max_size=500*1024*1024)  # 500MB limit
-    
+
     # Add routes
     app.router.add_post('/inference', inference_handler)
     app.router.add_get('/health', health_handler)
-    
+    app.router.add_get('/stats', stats_handler)  # 新增详细统计接口
+
     # Start background tasks after app is fully initialized
     app.on_startup.append(start_background_tasks)
     app.on_cleanup.append(cleanup_background_tasks)
-    
+
     return app
 
 if __name__ == '__main__':
     port = int(os.getenv("LB_PORT", "5001"))
     logger.info(f"Starting enhanced load balancer on port {port}")
     logger.info(f"Backend services: {BACKEND_SERVICES}")
+    logger.info(f"Total backends configured: {len(BACKEND_SERVICES)}")
     logger.info(f"Max queue size: {MAX_QUEUE_SIZE}")
     logger.info(f"Request timeout: {REQUEST_TIMEOUT}s")
     logger.info(f"Health check interval: {HEALTH_CHECK_INTERVAL}s")
