@@ -1,7 +1,7 @@
 # requirements.clean.txt
 
 # --- Core faster-whisper dependencies ---
-# ctranslate2>=4.0,<5  (您注释掉了，但这是核心，应该保留)
+ctranslate2>=4.0,<5
 huggingface_hub>=0.13
 tokenizers>=0.13,<1
 onnxruntime>=1.14,<2

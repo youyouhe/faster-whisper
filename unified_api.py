@@ -449,6 +449,153 @@ class UnifiedAPI:
                 logger.error(f"Task cancellation error: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
+        @self.app.post("/inference")
+        async def inference_compatible(
+            background_tasks: BackgroundTasks,
+            file: UploadFile = File(...),
+            response_format: str = Form("srt"),
+            language: str = Form("auto")
+        ):
+            """
+            兼容load_balancer的inference接口
+            保持与faster_whisper_api.py的接口一致性
+            """
+            if self.master_process is None:
+                raise HTTPException(status_code=503, detail="Master process not initialized")
+
+            try:
+                # 验证文件格式
+                file_ext = Path(file.filename).suffix.lower()
+                if file_ext not in self.config['supported_formats']:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported file format: {file_ext}. Supported formats: {self.config['supported_formats']}"
+                    )
+
+                # 验证response_format参数（load_balancer主要使用srt）
+                if response_format not in ['srt', 'json']:
+                    response_format = 'srt'  # 默认使用srt格式
+
+                # 读取文件内容
+                file_content = await file.read()
+                if not file_content:
+                    raise HTTPException(status_code=400, detail="Empty file")
+
+                # 检查文件大小
+                if len(file_content) > self.config['max_file_size']:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Maximum size: {self.config['max_file_size'] // (1024*1024)}MB"
+                    )
+
+                # 生成任务ID
+                task_id = str(uuid.uuid4())
+
+                logger.info(f"Received inference request {task_id}: {file.filename} ({len(file_content)} bytes)")
+
+                # 提交任务到主进程（使用同步模式以匹配load_balancer行为）
+                task_data = {
+                    'client_id': f"inference_client_{int(time.time())}",
+                    'audio_size': len(file_content),
+                    'response_format': response_format,
+                    'metadata': {
+                        'language': language,
+                        'original_filename': file.filename,
+                        'content_type': file.content_type,
+                        'inference_mode': True  # 标记为inference模式
+                    }
+                }
+
+                success, result = await self.master_process.submit_task(task_data)
+
+                if not success:
+                    raise HTTPException(status_code=500, detail=f"Task submission failed: {result}")
+
+                task_id = result
+
+                # 写入音频数据到共享内存
+                if task_id in self.master_process.tasks:
+                    task = self.master_process.tasks[task_id]
+                    if task.memory_offset is not None:
+                        # 获取GPU ID
+                        pool_gpu_id = task.memory_pool_gpu
+                        if pool_gpu_id is None:
+                            # 备用方案：检查offset属于哪个pool
+                            for gpu_id, pool in self.master_process.memory_pools.items():
+                                if task.memory_offset < pool.pool_size_bytes:
+                                    pool_gpu_id = gpu_id
+                                    break
+
+                            if pool_gpu_id is None:
+                                pool_gpu_id = 0
+                                logger.warning(f"INFERENCE: Could not determine GPU ID for task {task_id}, using GPU 0")
+
+                        pool = self.master_process.memory_pools.get(pool_gpu_id)
+                        if pool:
+                            logger.info(f"INFERENCE: Writing {len(file_content)} bytes to shared memory offset {task.memory_offset} (GPU {pool_gpu_id})")
+
+                            # 验证写入操作
+                            write_success = pool.write_data(file_content, task.memory_offset, task_id)
+                            if not write_success:
+                                logger.error(f"Failed to write audio data to shared memory for task {task_id}")
+                                pool.free_chunk(task_id)
+                                raise HTTPException(status_code=500, detail="Failed to write audio data to shared memory")
+                            else:
+                                logger.info(f"Successfully wrote audio data to shared memory for task {task_id}")
+
+                            # 验证写入的数据
+                            try:
+                                verify_data = pool.read_data(task.memory_offset, min(1024, len(file_content)))
+                                if verify_data is None or verify_data != file_content[:len(verify_data)]:
+                                    pool.free_chunk(task_id)
+                                    raise HTTPException(status_code=500, detail="Shared memory write verification failed")
+
+                                logger.info(f"INFERENCE: Shared memory write verification successful for {len(file_content)} bytes on GPU {pool_gpu_id}")
+                            except Exception as e:
+                                pool.free_chunk(task_id)
+                                raise HTTPException(status_code=500, detail=f"Shared memory verification failed: {str(e)}")
+                        else:
+                            logger.error(f"INFERENCE: No memory pool found for GPU {pool_gpu_id}")
+                            raise HTTPException(status_code=500, detail=f"Memory pool not available for GPU {pool_gpu_id}")
+
+                # 等待结果（同步模式，匹配load_balancer行为）
+                result = await self._wait_for_task_result(task_id, timeout=600)  # 10分钟超时
+
+                # 转换响应格式以匹配load_balancer期望
+                if response_format == 'srt':
+                    srt_content = result.get('text', result.get('result', ''))
+                    # 返回与faster_whisper_api.py相同格式的响应
+                    return JSONResponse({
+                        "code": 0,
+                        "msg": "ok",
+                        "data": srt_content
+                    })
+                else:
+                    # JSON格式响应
+                    return JSONResponse({
+                        "code": 0,
+                        "msg": "ok",
+                        "data": result
+                    })
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                import traceback
+                logger.error(f"Error processing inference request: {e}")
+                logger.error("Full traceback:", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
+        @self.app.get("/test-json")
+        async def test_json_response():
+            """测试接口，验证JSON响应格式"""
+            test_data = "1\n00:00:00,000 --> 00:00:02,000\n测试字幕内容\n\n2\n00:00:02,000 --> 00:00:04,000\n第二条字幕"
+            return {
+                "code": 0,
+                "msg": "ok",
+                "data": test_data
+            }
+
     async def _wait_for_task_result(self, task_id: str, timeout: int = 300) -> Dict[str, Any]:
         """等待任务结果"""
         start_time = time.time()
@@ -578,12 +725,26 @@ def parse_args():
                        default=int(os.getenv('MAX_FILE_SIZE', '50')),
                        help='Maximum file size in MB (default: 50 or MAX_FILE_SIZE env var)')
 
+    parser.add_argument('--gpus',
+                       type=str,
+                       default=os.getenv('CUDA_VISIBLE_DEVICES', ''),
+                       help='Comma-separated list of GPU IDs to use (e.g., "0,1,2" or "1")')
+
     return parser.parse_args()
 
 
 async def main():
     """主函数"""
     args = parse_args()
+
+    # 设置GPU可见性
+    if args.gpus:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
+        logger.info(f"Setting CUDA_VISIBLE_DEVICES to: {args.gpus}")
+    elif 'CUDA_VISIBLE_DEVICES' not in os.environ:
+        # 如果没有指定GPU，默认使用GPU 0
+        os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+        logger.info("No GPUs specified, defaulting to GPU 0")
 
     # 设置日志级别
     logging.basicConfig(
