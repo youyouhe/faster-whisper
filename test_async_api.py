@@ -171,7 +171,7 @@ class AsyncAPITester:
                         print(f"  Format: SRT")
                         print(f"  Segments: {result_data.get('segments_count', 'N/A')}")
                         # 显示SRT前几行
-                        lines = text.split('\n')[:6]  # 显示前2个subtitle段落
+                        lines = text.split('\n')[:30]  # 显示前2个subtitle段落
                         preview = '\n'.join(lines)
                         print(f"  SRT preview:\n    {preview}")
                     else:

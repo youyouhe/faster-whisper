@@ -4,6 +4,7 @@
 Unified API Gateway - Single-Port HTTP Service Interface
 """
 
+import argparse
 import asyncio
 import logging
 import os
@@ -467,14 +468,58 @@ class UnifiedAPI:
         server = uvicorn.Server(config)
         await server.serve()
 
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='Whisper Transcription API Server')
+
+    parser.add_argument('--host',
+                       default=os.getenv('API_HOST', '0.0.0.0'),
+                       help='Host to bind to (default: 0.0.0.0 or API_HOST env var)')
+
+    parser.add_argument('--port',
+                       type=int,
+                       default=int(os.getenv('API_PORT', '5001')),
+                       help='Port to bind to (default: 5001 or API_PORT env var)')
+
+    parser.add_argument('--workers-per-gpu',
+                       type=int,
+                       default=int(os.getenv('WORKERS_PER_GPU', '2')),
+                       help='Number of worker processes per GPU (default: 2 or WORKERS_PER_GPU env var)')
+
+    parser.add_argument('--log-level',
+                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                       default=os.getenv('LOG_LEVEL', 'INFO'),
+                       help='Log level (default: INFO or LOG_LEVEL env var)')
+
+    parser.add_argument('--max-file-size',
+                       type=int,
+                       default=int(os.getenv('MAX_FILE_SIZE', '50')),
+                       help='Maximum file size in MB (default: 50 or MAX_FILE_SIZE env var)')
+
+    return parser.parse_args()
+
+
 async def main():
     """主函数"""
+    args = parse_args()
+
+    # 设置日志级别
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, args.log_level),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
-    api = UnifiedAPI()
+    # 创建配置字典
+    config = {
+        'host': args.host,
+        'port': args.port,
+        'workers_per_gpu': args.workers_per_gpu,
+        'max_file_size': args.max_file_size * 1024 * 1024,  # MB to bytes
+        'supported_formats': ['.wav', '.mp3', '.m4a', '.flac', '.ogg', '.webm'],
+        'log_level': args.log_level
+    }
+
+    api = UnifiedAPI(config)
     await api.run()
 
 if __name__ == "__main__":
