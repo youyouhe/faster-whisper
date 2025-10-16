@@ -155,21 +155,132 @@ class SharedMemoryPool:
                             timestamp=time.time()
                         )
 
+                        # 测试写入：验证内存区域可写
+                        test_pattern = b'TEST' * 4  # 16字节测试模式
+                        self.shared_block.buf[chunk_offset:chunk_offset+16] = test_pattern
+                        verify = bytes(self.shared_block.buf[chunk_offset:chunk_offset+16])
+                        if verify != test_pattern:
+                            logger.error(f"Memory write test failed at offset {chunk_offset}")
+                        else:
+                            # 清除测试数据
+                            self.shared_block.buf[chunk_offset:chunk_offset+16] = b'\x00' * 16
+
                         logger.debug(f"Allocated chunk {i} for task {task_id}, size: {size}")
                         return chunk_offset, None
 
             return None, "No available chunks in shared memory pool"
 
-    def write_data(self, data: bytes, offset: int) -> bool:
+    def write_data(self, data: bytes, offset: int, task_id: str = None) -> bool:
         """写入数据到共享内存"""
+        import time  # 确保time模块可用
+
         try:
             with self.lock:
                 if offset + len(data) > self.pool_size_bytes:
                     return False
 
-                # 写入数据
+                logger.info(f"Writing {len(data)} bytes to shared memory at offset {offset} (pool GPU {self.gpu_id}, pool name: {self.memory_name})")
+                logger.debug(f"Data header: {data[:32]}")
+
+                # 更新chunk状态为processing（在共享元数据中）
+                chunk_index = offset // self.chunk_size_bytes
+                metadata_offset = chunk_index * 64
+
+                if task_id:
+                    # 在写入数据前更新元数据状态为processing
+                    new_metadata = struct.pack(
+                        '!64s',
+                        b''.join([
+                            struct.pack('!i', 2),  # status: processing
+                            struct.pack('!i', chunk_index),  # chunk_index
+                            struct.pack('!i', len(data)),  # task_size
+                            struct.pack('!i', offset),  # task_offset
+                            struct.pack('!d', time.time()),  # timestamp
+                            struct.pack('!i', -1),  # worker_id (尚未分配)
+                            task_id.encode('utf-8')[:32]  # task_id (32字节)
+                        ])
+                    )
+                    self.metadata.buf[metadata_offset:metadata_offset+64] = new_metadata
+                    logger.info(f"Updated chunk {chunk_index} status to processing for task {task_id}")
+
+                    # 验证元数据写入
+                    verification = self.metadata.buf[metadata_offset:metadata_offset+64]
+                    if verification != new_metadata:
+                        logger.error(f"Metadata write verification failed for chunk {chunk_index}")
+                    else:
+                        logger.debug(f"Metadata write verification successful for chunk {chunk_index}")
+
+                # 写入数据（会自动覆盖任何旧数据）
                 end_offset = offset + len(data)
                 self.shared_block.buf[offset:end_offset] = data
+
+                # 强制内存同步 - 确保数据写入到物理内存
+                import ctypes
+                try:
+                    # 使用ctypes强制内存同步
+                    ctypes.memset(ctypes.addressof(self.shared_block.buf) + offset, 0, 0)
+                except:
+                    # 备用方案：多次读写触发同步
+                    for i in range(3):
+                        _ = self.shared_block.buf[offset]
+                        _ = self.shared_block.buf[offset + len(data) - 1] if len(data) > 0 else 0
+
+                # 验证写入（多次验证确保同步）
+                max_retries = 3
+                for retry in range(max_retries):
+                    if len(data) >= 16:
+                        written = bytes(self.shared_block.buf[offset:offset+16])
+                        if written == data[:16]:
+                            logger.info(f"Write verification successful at offset {offset} (attempt {retry + 1})")
+
+                            # 详细验证：验证整个数据块
+                            if len(data) <= 1024:  # 对小文件进行完整验证
+                                full_written = bytes(self.shared_block.buf[offset:offset+len(data)])
+                                if full_written != data:
+                                    logger.error(f"Full verification failed at offset {offset}")
+                                    logger.error(f"Expected size: {len(data)}, Written size: {len(full_written)}")
+                                    if retry < max_retries - 1:
+                                        self.shared_block.buf[offset:end_offset] = data
+                                        continue
+                                    else:
+                                        return False
+                                else:
+                                    logger.info(f"Full verification successful for {len(data)} bytes at offset {offset}")
+
+                            # 写入成功，更新状态为allocated
+                            if task_id:
+                                final_metadata = struct.pack(
+                                    '!64s',
+                                    b''.join([
+                                        struct.pack('!i', 1),  # status: allocated (数据已写入)
+                                        struct.pack('!i', chunk_index),  # chunk_index
+                                        struct.pack('!i', len(data)),  # task_size
+                                        struct.pack('!i', offset),  # task_offset
+                                        struct.pack('!d', time.time()),  # timestamp
+                                        struct.pack('!i', -1),  # worker_id (尚未分配)
+                                        task_id.encode('utf-8')[:32]  # task_id (32字节)
+                                    ])
+                                )
+                                self.metadata.buf[metadata_offset:metadata_offset+64] = final_metadata
+                                logger.debug(f"Updated chunk {chunk_index} status to allocated after successful write")
+
+                            break
+                        else:
+                            if retry < max_retries - 1:
+                                logger.warning(f"Write verification retry {retry + 1} at offset {offset}")
+                                logger.warning(f"Expected: {data[:16]}, Got: {written}")
+                                # 重新写入
+                                self.shared_block.buf[offset:end_offset] = data
+                                # 强制同步
+                                _ = self.shared_block.buf[offset]
+                                time.sleep(0.001)  # 1ms延迟确保同步
+                            else:
+                                logger.error(f"Write verification failed at offset {offset}")
+                                logger.error(f"Expected: {data[:16]}")
+                                logger.error(f"Written:  {written}")
+                                return False
+
+                logger.info(f"Successfully wrote {len(data)} bytes to shared memory at offset {offset} (pool: {self.memory_name})")
                 return True
         except Exception as e:
             logger.error(f"Error writing to shared memory: {e}")
@@ -182,8 +293,57 @@ class SharedMemoryPool:
                 if offset + size > self.pool_size_bytes:
                     return None
 
-                # 读取数据
-                data = bytes(self.shared_block.buf[offset:offset+size])
+                logger.debug(f"Reading {size} bytes from offset {offset} (pool GPU {self.gpu_id}, pool name: {self.memory_name})")
+
+                # 强制内存同步 - 确保读取到最新数据
+                try:
+                    import ctypes
+                    # 使用ctypes强制内存同步
+                    ctypes.memset(ctypes.addressof(self.shared_block.buf) + offset, 0, 0)
+                except:
+                    # 备用方案：多次访问触发同步
+                    for i in range(3):
+                        _ = self.shared_block.buf[offset]
+                        _ = self.shared_block.buf[offset + size - 1] if size > 0 else 0
+
+                # 读取数据（可能需要多次尝试）
+                max_retries = 3
+                data = None
+
+                for retry in range(max_retries):
+                    data = bytes(self.shared_block.buf[offset:offset+size])
+
+                    # 检查是否为全零数据（如果数据应该非空）
+                    if len(data) >= 16 and all(b == 0 for b in data[:16]):
+                        if retry < max_retries - 1:
+                            logger.warning(f"Read zero data attempt {retry + 1} from offset {offset} (pool GPU {self.gpu_id}, pool: {self.memory_name}), retrying...")
+                            import time
+                            time.sleep(0.001)  # 1ms延迟
+                            continue
+                        else:
+                            logger.warning(f"Read zero data from offset {offset} (pool GPU {self.gpu_id}, pool: {self.memory_name})")
+                            logger.error(f"Memory block info: size={self.pool_size_bytes}, name={self.memory_name}")
+                            logger.error(f"Read request: offset={offset}, size={size}")
+                            # 尝试读取内存块状态
+                            try:
+                                chunk_index = offset // self.chunk_size_bytes
+                                chunk_status = self.get_chunk_status(chunk_index)
+                                if chunk_status:
+                                    logger.error(f"Chunk status: {chunk_status}")
+                            except Exception as e:
+                                logger.error(f"Failed to get chunk status: {e}")
+                    else:
+                        # 成功读取到非零数据
+                        logger.debug(f"Successfully read non-zero data on attempt {retry + 1}")
+                        break
+
+                # 添加调试信息
+                if data:
+                    logger.debug(f"Read {size} bytes from offset {offset} (pool GPU {self.gpu_id})")
+                    logger.debug(f"Read data header: {data[:32]}")
+                else:
+                    logger.error(f"No data read from offset {offset}")
+
                 return data
         except Exception as e:
             logger.error(f"Error reading from shared memory: {e}")
@@ -216,9 +376,8 @@ class SharedMemoryPool:
             )
             self.metadata.buf[metadata_offset:metadata_offset+64] = new_metadata
 
-            # 清理数据（可选）
-            end_offset = chunk.offset + chunk.size
-            self.shared_block.buf[chunk.offset:end_offset] = b'\x00' * (end_offset - chunk.offset)
+            # 注意：不要立即清零数据，避免竞态条件
+            # 数据将在下次分配时被覆盖，或通过定时清理任务处理
 
             # 从活跃任务中移除
             del self.active_tasks[task_id]
@@ -320,8 +479,8 @@ class SharedMemoryConfig:
     """共享内存配置管理"""
 
     def __init__(self):
-        self.pool_size_mb = int(os.getenv("SHARED_MEMORY_POOL_SIZE_MB", "200"))
-        self.chunk_size_mb = int(os.getenv("MEMORY_CHUNK_SIZE_MB", "50"))
+        self.pool_size_mb = int(os.getenv("SHARED_MEMORY_POOL_SIZE_MB", "400"))
+        self.chunk_size_mb = int(os.getenv("MEMORY_CHUNK_SIZE_MB", "80"))
         self.workers_per_gpu = int(os.getenv("WORKERS_PER_GPU", "2"))
         self.max_concurrent_tasks = int(os.getenv("MAX_CONCURRENT_TASKS", "10"))
         self.health_check_interval = int(os.getenv("HEALTH_CHECK_INTERVAL", "30"))

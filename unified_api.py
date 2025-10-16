@@ -190,12 +190,47 @@ class UnifiedAPI:
                 if task_id in self.master_process.tasks:
                     task = self.master_process.tasks[task_id]
                     if task.memory_offset is not None:
-                        # 写入音频数据到共享内存
-                        pool = self.master_process._get_best_memory_pool()
+                        # 直接从TaskInfo获取GPU ID
+                        pool_gpu_id = task.memory_pool_gpu
+                        if pool_gpu_id is None:
+                            # 备用方案：检查offset属于哪个pool
+                            for gpu_id, pool in self.master_process.memory_pools.items():
+                                if task.memory_offset < pool.pool_size_bytes:
+                                    pool_gpu_id = gpu_id
+                                    break
+
+                            if pool_gpu_id is None:
+                                pool_gpu_id = 0
+                                logger.warning(f"Could not determine GPU ID for task {task_id}, using GPU 0")
+
+                        pool = self.master_process.memory_pools.get(pool_gpu_id)
                         if pool:
-                            if not pool.write_data(file_content, task.memory_offset):
+                            logger.info(f"Writing {len(file_content)} bytes to shared memory offset {task.memory_offset} (GPU {pool_gpu_id})")
+
+                            # 验证写入操作
+                            write_success = pool.write_data(file_content, task.memory_offset, task_id)
+                            if not write_success:
+                                logger.error(f"Failed to write audio data to shared memory for task {task_id}")
                                 pool.free_chunk(task_id)
                                 raise HTTPException(status_code=500, detail="Failed to write audio data to shared memory")
+                            else:
+                                logger.info(f"Successfully wrote audio data to shared memory for task {task_id}")
+
+                            # 验证写入的数据
+                            try:
+                                # 读取部分数据进行验证
+                                verify_data = pool.read_data(task.memory_offset, min(1024, len(file_content)))
+                                if verify_data is None or verify_data != file_content[:len(verify_data)]:
+                                    pool.free_chunk(task_id)
+                                    raise HTTPException(status_code=500, detail="Shared memory write verification failed")
+
+                                logger.info(f"Shared memory write verification successful for {len(file_content)} bytes on GPU {pool_gpu_id}")
+                            except Exception as e:
+                                pool.free_chunk(task_id)
+                                raise HTTPException(status_code=500, detail=f"Shared memory verification failed: {str(e)}")
+                        else:
+                            logger.error(f"No memory pool found for GPU {pool_gpu_id}")
+                            raise HTTPException(status_code=500, detail=f"Memory pool not available for GPU {pool_gpu_id}")
 
                 # 等待结果（同步模式）
                 result = await self._wait_for_task_result(task_id, timeout=300)
@@ -210,7 +245,9 @@ class UnifiedAPI:
             except HTTPException:
                 raise
             except Exception as e:
-                logger.error(f"Transcription error: {e}")
+                import traceback
+                logger.error(f"Error processing request: {e}")
+                logger.error("Full traceback:", exc_info=True)
                 raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
         @self.app.post("/transcribe_async")
@@ -273,11 +310,51 @@ class UnifiedAPI:
                 if task_id in self.master_process.tasks:
                     task = self.master_process.tasks[task_id]
                     if task.memory_offset is not None:
-                        pool = self.master_process._get_best_memory_pool()
+                        # 直接从TaskInfo获取GPU ID
+                        pool_gpu_id = task.memory_pool_gpu
+                        if pool_gpu_id is None:
+                            # 备用方案：检查offset属于哪个pool
+                            for gpu_id, pool in self.master_process.memory_pools.items():
+                                if task.memory_offset < pool.pool_size_bytes:
+                                    pool_gpu_id = gpu_id
+                                    break
+
+                            if pool_gpu_id is None:
+                                pool_gpu_id = 0
+                                logger.warning(f"ASYNC: Could not determine GPU ID for task {task_id}, using GPU 0")
+
+                        pool = self.master_process.memory_pools.get(pool_gpu_id)
                         if pool:
-                            if not pool.write_data(file_content, task.memory_offset):
+                            logger.info(f"ASYNC: Writing {len(file_content)} bytes to shared memory offset {task.memory_offset} (GPU {pool_gpu_id})")
+
+                            # 验证写入操作
+                            write_success = pool.write_data(file_content, task.memory_offset, task_id)
+                            if not write_success:
+                                logger.error(f"Failed to write audio data to shared memory for task {task_id}")
                                 pool.free_chunk(task_id)
                                 raise HTTPException(status_code=500, detail="Failed to write audio data to shared memory")
+                            else:
+                                logger.info(f"Successfully wrote audio data to shared memory for task {task_id}")
+
+                            # 验证写入的数据
+                            try:
+                                # 读取部分数据进行验证
+                                verify_data = pool.read_data(task.memory_offset, min(1024, len(file_content)))
+                                if verify_data is None or verify_data != file_content[:len(verify_data)]:
+                                    pool.free_chunk(task_id)
+                                    raise HTTPException(status_code=500, detail="Shared memory write verification failed")
+
+                                logger.info(f"ASYNC: Shared memory write verification successful for {len(file_content)} bytes on GPU {pool_gpu_id}")
+                            except Exception as e:
+                                pool.free_chunk(task_id)
+                                raise HTTPException(status_code=500, detail=f"Shared memory verification failed: {str(e)}")
+                        else:
+                            logger.error(f"ASYNC: No memory pool found for GPU {pool_gpu_id}")
+                            raise HTTPException(status_code=500, detail=f"Memory pool not available for GPU {pool_gpu_id}")
+                    else:
+                        logger.error(f"ASYNC: No memory offset for task {task_id}")
+                else:
+                    logger.error(f"ASYNC: Task {task_id} not found in master process tasks")
 
                 # 添加回调任务
                 if callback_url:
@@ -441,7 +518,7 @@ class UnifiedAPI:
     async def start_master_process(self):
         """启动主进程"""
         try:
-            self.master_process = MasterProcess()
+            self.master_process = MasterProcess(self.config)
             # 在后台启动主进程
             asyncio.create_task(self.master_process.start())
             logger.info("Master process started")
@@ -486,6 +563,11 @@ def parse_args():
                        default=int(os.getenv('WORKERS_PER_GPU', '2')),
                        help='Number of worker processes per GPU (default: 2 or WORKERS_PER_GPU env var)')
 
+    parser.add_argument('--model',
+                       default=os.getenv('WHISPER_MODEL', 'large-v3-turbo'),
+                       choices=['tiny', 'base', 'small', 'medium', 'large-v1', 'large-v2', 'large-v3', 'large-v3-turbo'],
+                       help='Whisper model to use (default: large-v3-turbo or WHISPER_MODEL env var)')
+
     parser.add_argument('--log-level',
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                        default=os.getenv('LOG_LEVEL', 'INFO'),
@@ -514,9 +596,16 @@ async def main():
         'host': args.host,
         'port': args.port,
         'workers_per_gpu': args.workers_per_gpu,
+        'model': args.model,  # 添加模型配置
         'max_file_size': args.max_file_size * 1024 * 1024,  # MB to bytes
         'supported_formats': ['.wav', '.mp3', '.m4a', '.flac', '.ogg', '.webm'],
-        'log_level': args.log_level
+        'log_level': args.log_level,
+        # MasterProcess需要的配置参数
+        'max_queue_size': int(os.getenv('MAX_QUEUE_SIZE', '100')),
+        'health_check_interval': int(os.getenv('HEALTH_CHECK_INTERVAL', '30')),
+        'task_timeout': int(os.getenv('TASK_TIMEOUT', '300')),
+        'max_retries': int(os.getenv('MAX_RETRIES', '3')),
+        'gpu_memory_fraction': float(os.getenv('GPU_MEMORY_FRACTION', '0.8'))
     }
 
     api = UnifiedAPI(config)

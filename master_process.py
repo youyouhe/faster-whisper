@@ -50,6 +50,7 @@ class TaskInfo:
     completed_at: Optional[float] = None
     worker_id: Optional[int] = None
     memory_offset: Optional[int] = None
+    memory_pool_gpu: Optional[int] = None  # 添加内存池GPU ID信息
     result_data: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
     retry_count: int = 0
@@ -103,6 +104,7 @@ class MasterProcess:
         """获取默认配置"""
         return {
             'workers_per_gpu': int(os.getenv('WORKERS_PER_GPU', '2')),
+            'model': os.getenv('WHISPER_MODEL', 'large-v3-turbo'),
             'max_queue_size': int(os.getenv('MAX_QUEUE_SIZE', '100')),
             'health_check_interval': int(os.getenv('HEALTH_CHECK_INTERVAL', '30')),
             'task_timeout': int(os.getenv('TASK_TIMEOUT', '300')),
@@ -128,14 +130,23 @@ class MasterProcess:
 
     def _get_gpu_count(self) -> int:
         """获取GPU数量"""
-        # 先专注于单GPU测试
-        return 1
-        # try:
-        #     import torch
-        #     return torch.cuda.device_count()
-        # except ImportError:
-        #     logger.warning("PyTorch not available, assuming single GPU")
-        #     return 1
+        # 优先从CUDA_VISIBLE_DEVICES环境变量获取GPU数量
+        if 'CUDA_VISIBLE_DEVICES' in os.environ:
+            devices = os.environ['CUDA_VISIBLE_DEVICES'].strip()
+            if devices:
+                gpu_count = len(devices.split(','))
+                logger.info(f"Detected {gpu_count} GPU(s) from CUDA_VISIBLE_DEVICES: {devices}")
+                return gpu_count
+
+        # 备用方案：使用PyTorch检测
+        try:
+            import torch
+            gpu_count = torch.cuda.device_count()
+            logger.info(f"Detected {gpu_count} GPU(s) from PyTorch")
+            return gpu_count
+        except ImportError:
+            logger.warning("PyTorch not available, assuming single GPU")
+            return 1
 
     def _setup_signal_handlers(self):
         """设置信号处理器"""
@@ -221,7 +232,21 @@ class MasterProcess:
             self.workers[worker_id] = worker_info
 
             # 等待工作进程启动
-            await asyncio.sleep(2)  # 增加等待时间，确保模型加载完成
+            # 为同一GPU上的多个worker错开启动时间，避免GPU内存竞争
+            if gpu_id > 0:
+                # 每个GPU延迟启动，避免同时加载模型
+                delay = gpu_id * 3  # 每个GPU延迟3秒
+                logger.info(f"Delaying worker {worker_id} startup by {delay}s to avoid GPU memory conflicts")
+                await asyncio.sleep(delay)
+            else:
+                # GPU 0上的多个worker也需要错开
+                if worker_id > 0:
+                    delay = (worker_id % 2) * 5  # 同一GPU上的worker错开5秒
+                    logger.info(f"Delaying GPU 0 worker {worker_id} startup by {delay}s to avoid memory conflicts")
+                    await asyncio.sleep(delay)
+
+            # 基础等待时间，确保模型加载完成
+            await asyncio.sleep(2)
 
             # 检查进程是否正常运行
             if process.is_alive():
@@ -242,7 +267,8 @@ class MasterProcess:
         """工作进程主函数"""
         try:
             from worker_process import worker_main
-            worker_main(worker_id, gpu_id, task_queue, result_queue)
+            model_path = self.config.get('model', 'large-v3-turbo')
+            worker_main(worker_id, gpu_id, task_queue, result_queue, model_path)
         except Exception as e:
             logger.error(f"Worker {worker_id} fatal error: {e}")
 
@@ -273,14 +299,22 @@ class MasterProcess:
                     task_info.error_message = f"Memory allocation failed: {error}"
                     return False, error
                 task_info.memory_offset = offset
+                task_info.memory_pool_gpu = memory_pool.gpu_id  # 存储GPU ID信息
+                pool_gpu_id = memory_pool.gpu_id
+                logger.info(f"Task {task_id}: Allocated memory from GPU {pool_gpu_id} at offset {offset}")
+            else:
+                logger.warning(f"Task {task_id}: No memory pool available")
+                pool_gpu_id = None
+                offset = None
 
             # 添加到任务队列
             await self.task_queue.put({
                 'task_id': task_id,
                 'task_data': task_data,
-                'memory_pool_gpu': memory_pool.gpu_id if memory_pool else None,
+                'memory_pool_gpu': pool_gpu_id,
                 'memory_offset': offset,
-                'audio_size': task_info.audio_size
+                'audio_size': task_info.audio_size,
+                'gpu_id': pool_gpu_id  # 明确指定使用哪个GPU的内存池
             })
 
             self.stats['total_tasks'] += 1
@@ -302,12 +336,17 @@ class MasterProcess:
                     timeout=1.0
                 )
 
-                # 找到空闲工作进程
-                worker = self._find_idle_worker()
+                # 获取任务指定的GPU ID
+                task_gpu_id = task.get('gpu_id')
+
+                # 找到空闲工作进程（优先选择匹配的GPU）
+                worker = self._find_idle_worker(task_gpu_id)
                 if worker:
+                    logger.info(f"Task {task.get('task_id')}: Assigned to worker {worker.worker_id} (GPU {worker.gpu_id}), data from GPU {task_gpu_id}")
                     await self._assign_task_to_worker(task, worker)
                 else:
                     # 没有空闲工作进程，重新放回队列
+                    logger.warning(f"Task {task.get('task_id')}: No available worker for GPU {task_gpu_id}, requeuing")
                     await self.task_queue.put(task)
                     await asyncio.sleep(0.1)
 
@@ -333,6 +372,7 @@ class MasterProcess:
 
             # 真实分配任务给工作进程
             logger.info(f"Assigning task {task_id} to worker {worker.worker_id}")
+            logger.debug(f"Task {task_id} details: memory_pool_gpu={task.get('memory_pool_gpu')}, memory_offset={task.get('memory_offset')}")
 
             # 将任务放入工作进程的队列
             try:
@@ -467,7 +507,7 @@ class MasterProcess:
         except Exception as e:
             logger.error(f"Error processing result: {e}")
 
-    def _find_idle_worker(self) -> Optional[WorkerInfo]:
+    def _find_idle_worker(self, gpu_id: Optional[int] = None) -> Optional[WorkerInfo]:
         """找到空闲工作进程 - 使用负载均衡算法"""
         idle_workers = [worker for worker in self.workers.values()
                        if worker.status == 'idle' and worker.process.is_alive()]
@@ -475,23 +515,58 @@ class MasterProcess:
         if not idle_workers:
             return None
 
+        # 如果指定了GPU ID，优先选择该GPU上的工作进程
+        if gpu_id is not None:
+            gpu_workers = [worker for worker in idle_workers if worker.gpu_id == gpu_id]
+            if gpu_workers:
+                return min(gpu_workers, key=lambda w: w.task_count)
+
         # 选择任务数最少的工作进程（负载均衡）
         return min(idle_workers, key=lambda w: w.task_count)
 
     def _get_best_memory_pool(self) -> Optional[SharedMemoryPool]:
-        """获取最佳共享内存池"""
+        """获取最佳共享内存池 - 优先选择有可用工作进程的GPU"""
         if not self.memory_pools:
             return None
 
-        # 简单轮询策略，后续可以实现更智能的分配
-        available_pools = [pool for pool in self.memory_pools.values()
-                          if pool.get_pool_stats()['free_chunks'] > 0]
+        # 获取所有可用的内存池，并检查对应GPU是否有空闲工作进程
+        available_pools = []
+        for pool in self.memory_pools.values():
+            pool_stats = pool.get_pool_stats()
+            if pool_stats['free_chunks'] > 0:
+                # 检查该GPU是否有空闲的工作进程
+                has_idle_worker = any(w.status == 'idle' and w.process.is_alive()
+                                    for w in self.workers.values() if w.gpu_id == pool.gpu_id)
 
-        if available_pools:
-            # 选择GPU ID最小的可用池
-            return min(available_pools, key=lambda p: p.gpu_id)
+                if has_idle_worker:
+                    # 计算该GPU上所有工作进程的总任务数
+                    gpu_task_count = sum(w.task_count for w in self.workers.values() if w.gpu_id == pool.gpu_id)
+                    idle_workers_count = sum(1 for w in self.workers.values()
+                                           if w.gpu_id == pool.gpu_id and w.status == 'idle' and w.process.is_alive())
+                    available_pools.append((pool, gpu_task_count, pool_stats['free_chunks'], idle_workers_count))
 
-        return None
+        if not available_pools:
+            logger.warning("No memory pools with available workers found")
+            # 作为备用方案，考虑所有可用的内存池（即使没有空闲工作进程）
+            for pool in self.memory_pools.values():
+                pool_stats = pool.get_pool_stats()
+                if pool_stats['free_chunks'] > 0:
+                    gpu_task_count = sum(w.task_count for w in self.workers.values() if w.gpu_id == pool.gpu_id)
+                    available_pools.append((pool, gpu_task_count, pool_stats['free_chunks'], 0))
+
+        if not available_pools:
+            return None
+
+        # 优化选择策略：
+        # 1. 优先选择有空闲工作进程的GPU
+        # 2. 在有空闲工作进程的GPU中，选择任务数最少的
+        # 3. 如果任务数相同，选择空闲chunk最多的
+        # 4. 如果还相同，选择GPU ID较小的
+        best_pool = min(available_pools, key=lambda x: (-x[3], x[1], -x[2], x[0].gpu_id))
+
+        pool = best_pool[0]
+        logger.info(f"Selected memory pool from GPU {pool.gpu_id} (idle workers: {best_pool[3]}, GPU task count: {best_pool[1]}, free chunks: {best_pool[2]})")
+        return pool
 
     def _get_memory_pool_by_gpu(self, gpu_id: int) -> Optional[SharedMemoryPool]:
         """根据GPU ID获取内存池"""
