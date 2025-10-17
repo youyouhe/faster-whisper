@@ -33,7 +33,7 @@ from pathlib import Path
 
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)  # 改为DEBUG级别
 logger = logging.getLogger(__name__)
 
 # Database configuration
@@ -202,45 +202,127 @@ async def parse_multipart_data(data: bytes, boundary: str) -> bytes:
         boundary_bytes = f"--{boundary}".encode('utf-8')
         end_boundary_bytes = f"--{boundary}--".encode('utf-8')
 
-        # Find the start of the audio data (after headers)
-        # Look for the boundary, then skip headers until we find the empty line
+        logger.debug(f"Parsing multipart data with boundary: {boundary}")
+        logger.debug(f"Boundary bytes: {boundary_bytes}")
+        logger.debug(f"Total data size: {len(data)} bytes")
+
+        # First, try to find boundaries with exact match
+        boundary_positions = []
         start_idx = 0
-        while start_idx < len(data):
-            # Find next boundary
+        while True:
             boundary_idx = data.find(boundary_bytes, start_idx)
             if boundary_idx == -1:
-                logger.error("Could not find starting boundary in multipart data")
-                raise ValueError("Could not find starting boundary in multipart data")
+                break
+            boundary_positions.append(boundary_idx)
+            start_idx = boundary_idx + len(boundary_bytes)
+
+        logger.debug(f"Found {len(boundary_positions)} boundary positions with exact match")
+
+        # If no exact matches, try a more flexible approach
+        if len(boundary_positions) == 0:
+            logger.debug("No exact boundary matches, trying flexible approach")
+            # Look for the boundary without the leading --
+            flexible_boundary = boundary.encode('utf-8')
+            flexible_positions = []
+            start_idx = 0
+            while True:
+                boundary_idx = data.find(flexible_boundary, start_idx)
+                if boundary_idx == -1:
+                    break
+                # Check if this looks like a valid boundary (preceded by -- or newline)
+                if boundary_idx == 0 or data[boundary_idx-1:boundary_idx] in [b'-', b'\n']:
+                    flexible_positions.append(boundary_idx)
+                start_idx = boundary_idx + len(flexible_boundary)
+
+            if len(flexible_positions) > 0:
+                boundary_positions = flexible_positions
+                logger.debug(f"Found {len(boundary_positions)} boundary positions with flexible match")
+
+        if len(boundary_positions) == 0:
+            # Last resort: try to find any section that looks like audio data
+            logger.debug("No boundaries found, trying to locate audio data directly")
+            # Look for RIFF header (WAV), ID3 (MP3), or OggS (OGG)
+            audio_patterns = [b'RIFF', b'ID3', b'OggS']
+            for pattern in audio_patterns:
+                pattern_pos = data.find(pattern)
+                if pattern_pos != -1 and pattern_pos > 100:  # Not at the very beginning (skip headers)
+                    # Found what looks like audio data
+                    logger.debug(f"Found audio pattern {pattern} at position {pattern_pos}")
+                    # Extract everything from this point until near the end
+                    # Leave some buffer for the end boundary
+                    content = data[pattern_pos:len(data)-100]
+                    return content
+
+            raise ValueError(f"Could not find boundary '{boundary}' in multipart data")
+
+        logger.debug(f"Processing {len(boundary_positions)} boundary sections")
+
+        # Process each section between boundaries
+        for i in range(len(boundary_positions) - 1):
+            current_boundary = boundary_positions[i]
+            next_boundary = boundary_positions[i + 1]
 
             # Find the end of headers (double newline)
-            header_end_idx = data.find(b'\r\n\r\n', boundary_idx)
+            header_end_idx = data.find(b'\r\n\r\n', current_boundary)
             if header_end_idx == -1:
                 # Try with just \n\n
-                header_end_idx = data.find(b'\n\n', boundary_idx)
+                header_end_idx = data.find(b'\n\n', current_boundary)
                 if header_end_idx == -1:
-                    start_idx = boundary_idx + len(boundary_bytes)
+                    logger.debug(f"No header end found for section {i}")
                     continue
 
             # Extract content between headers and next boundary
             content_start = header_end_idx + 4 if data[header_end_idx:header_end_idx+4] == b'\r\n\r\n' else header_end_idx + 2
-            content_end = data.find(boundary_bytes, content_start)
+            content_end = next_boundary
 
-            # If we found another boundary, this is our content
-            if content_end != -1:
-                # Check if this section contains the audio file
-                # Look for filename in the headers part
-                header_part = data[boundary_idx:header_end_idx].decode('utf-8', errors='ignore')
-                if 'filename=' in header_part or 'name="audio"' in header_part:
-                    # This is the audio content
-                    return data[content_start:content_end].strip()
+            # Ensure content_end is valid
+            if content_end <= content_start:
+                continue
 
-            start_idx = header_end_idx + 4
+            # Check if this section contains the audio file
+            header_part = data[current_boundary:header_end_idx].decode('utf-8', errors='ignore')
+            logger.debug(f"Section {i} headers: {header_part[:200]}...")
+
+            if 'filename=' in header_part or 'name="audio"' in header_part or 'name="file"' in header_part:
+                # This is the audio content
+                content = data[content_start:content_end].rstrip(b'\r\n')
+                logger.debug(f"Found audio content: {len(content)} bytes")
+                return content
+
+        # Also check the last section (before final boundary)
+        if len(boundary_positions) >= 1:
+            last_boundary = boundary_positions[-1]
+            header_end_idx = data.find(b'\r\n\r\n', last_boundary)
+            if header_end_idx == -1:
+                header_end_idx = data.find(b'\n\n', last_boundary)
+
+            if header_end_idx != -1:
+                content_start = header_end_idx + 4 if data[header_end_idx:header_end_idx+4] == b'\r\n\r\n' else header_end_idx + 2
+                # Find the end boundary
+                end_boundary_idx = data.find(end_boundary_bytes, content_start)
+                if end_boundary_idx != -1:
+                    content_end = end_boundary_idx
+                else:
+                    content_end = len(data)
+
+                header_part = data[last_boundary:header_end_idx].decode('utf-8', errors='ignore')
+                if 'filename=' in header_part or 'name="audio"' in header_part or 'name="file"' in header_part:
+                    content = data[content_start:content_end].rstrip(b'\r\n')
+                    logger.debug(f"Found audio content in last section: {len(content)} bytes")
+                    return content
 
         logger.error("No audio file found in multipart data")
+        # Debug: print first 500 bytes to understand the structure
+        logger.debug(f"First 500 bytes of data: {data[:500]}")
+        logger.debug(f"Last 500 bytes of data: {data[-500:]}")
         raise ValueError("No audio file found in multipart data")
 
     except Exception as e:
         logger.error(f"Error parsing multipart data: {e}")
+        # Debug: show more details about the error
+        logger.debug(f"Boundary: {boundary}")
+        logger.debug(f"Boundary bytes: {boundary_bytes}")
+        logger.debug(f"Data size: {len(data)}")
         raise
 
 def generate_backend_services():
@@ -287,6 +369,7 @@ class QueuedRequest:
     future: asyncio.Future
     timestamp: float
     file_size: Optional[int] = None  # Store file size for progressive timeout
+    audio_data: Optional[bytes] = None  # Pre-extracted audio data to avoid re-parsing
 
 # Global state
 BACKEND_STATUS = {service: True for service in BACKEND_SERVICES}  # Assume all healthy initially
@@ -427,64 +510,126 @@ def get_healthy_backends() -> List[str]:
 
 def get_available_backends() -> List[str]:
     """Get list of currently available (healthy and not busy) backends"""
-    return [service for service, is_healthy in BACKEND_STATUS.items()
-            if is_healthy and not BACKEND_BUSY.get(service, False)]
+    available = []
+    for service, is_healthy in BACKEND_STATUS.items():
+        is_busy = BACKEND_BUSY.get(service, False)
+        is_distributed_busy = service in distributed_processor.busy_backends
+        if is_healthy and not is_busy and not is_distributed_busy:
+            available.append(service)
+        logger.debug(f"Backend {service}: healthy={is_healthy}, busy={is_busy}, distributed_busy={is_distributed_busy}, available={is_healthy and not is_busy and not is_distributed_busy}")
+    return available
 
 def get_idle_backend() -> Optional[str]:
     """Get an idle backend using round-robin algorithm"""
     global current_index
-    available_backends = [
-        service for service in BACKEND_STATUS.items() 
-        if service[1] and not BACKEND_BUSY.get(service[0], False)
-    ]
-    
+    available_backends = []
+    for service, is_healthy in BACKEND_STATUS.items():
+        is_busy = BACKEND_BUSY.get(service, False)
+        is_distributed_busy = service in distributed_processor.busy_backends
+        if is_healthy and not is_busy and not is_distributed_busy:
+            available_backends.append((service, is_healthy))
+
     if not available_backends:
         return None
-    
+
     # Round-robin selection from available backends
     backend = available_backends[current_index % len(available_backends)][0]
     current_index = (current_index + 1) % len(available_backends)
+    logger.debug(f"Selected idle backend: {backend}")
     return backend
 
-async def add_request_to_queue(request: web.Request, request_body: bytes) -> asyncio.Future:
-    """Add a request to the queue and return a future for the result"""
+async def add_request_to_queue(request: web.Request, request_body: bytes) -> Tuple[asyncio.Future, str]:
+    """Add a request to the queue and return a future for the result and the request ID"""
     if len(REQUEST_QUEUE) >= MAX_QUEUE_SIZE:
         raise web.HTTPServiceUnavailable(reason="Request queue is full")
-    
+
     request_id = str(uuid.uuid4())
     future = asyncio.get_event_loop().create_future()
-    
+
     # Handle multipart data
     form_data = None
-    file_size = None
-    if request.content_type and 'multipart/form-data' in request.content_type:
-        # Parse multipart data and store as FormData
+    # Determine content type from full header to preserve boundary
+    content_type_header = request.headers.get('Content-Type', '') or ''
+    is_multipart = 'multipart/form-data' in content_type_header.lower()
+    # Default file size to raw request_body length; update later if we extract audio_data
+    file_size = len(request_body) if request_body else 0
+
+    # Pre-extract audio data for multipart requests to avoid re-parsing later
+    audio_data = None
+    if is_multipart:
         try:
-            form_data = aiohttp.FormData()
-            reader = await request.multipart()
-            
-            while True:
-                field = await reader.next()
-                if field is None:
-                    break
-                
-                if field.filename:
-                    # File field - read the content
-                    content = await field.read()
-                    form_data.add_field(field.name, content, filename=field.filename, content_type=field.content_type)
-                    # Store file size for progressive timeout
-                    file_size = len(content)
+            import re
+            # Extract boundary from full Content-Type header
+            boundary_match = re.search(r'boundary\s*=\s*([^;\s]+)', content_type_header, re.IGNORECASE)
+            if not boundary_match:
+                # Fallback to string splitting if regex fails
+                if 'boundary=' in content_type_header:
+                    boundary = content_type_header.split('boundary=')[-1].split(';')[0].strip(' "\'')
                 else:
-                    # Regular field
-                    content = await field.text()
-                    form_data.add_field(field.name, content)
+                    raise ValueError(f"No boundary found in Content-Type: {content_type_header}")
+            else:
+                boundary = boundary_match.group(1).strip(' "\'')
+            logger.debug(f"Using boundary '{boundary}' (length: {len(boundary)}) from Content-Type")
+            logger.debug(f"Pre-extracting audio data for queued request {request_id}")
+            audio_data = await parse_multipart_data(request_body, boundary)
+            file_size = len(audio_data)
+            logger.info(f"✅ Pre-extracted audio data for queued request {request_id}: {len(audio_data)} bytes")
+
+            # For SRT-only support, we always use 'srt' format
+            # Build a minimal FormData to send downstream with fixed SRT format
+            form_data = aiohttp.FormData()
+            filename = f"audio_{int(time.time())}.wav"
+            form_data.add_field('file', audio_data, filename=filename, content_type='audio/wav')
+            form_data.add_field('response_format', 'srt')  # Always SRT
         except Exception as e:
-            logger.error(f"Error parsing multipart data: {e}")
+            logger.warning(f"Failed to pre-extract audio data for queued request {request_id}: {e}")
+            # Do not re-read the request stream; fall back to pattern-based extraction on the buffered body
+            try:
+                logger.debug("Using audio pattern extraction as fallback")
+                # Look for audio headers - RIFF, ID3, OggS after some headers
+                header_end = request_body.find(b'\r\n\r\n')
+                if header_end > 0:
+                    search_start = max(100, header_end - 1000)  # Search around headers
+                    for pattern in [b'RIFF', b'ID3', b'OggS']:
+                        pattern_pos = request_body.find(pattern, search_start)
+                        if pattern_pos > 0 and pattern_pos < len(request_body) - 100:
+                            # Extract everything from the pattern to near the end
+                            audio_data = request_body[pattern_pos:len(request_body)-100]
+                            file_size = len(audio_data)
+                            logger.info(f"✅ Pattern-based audio extraction succeeded for queued request {request_id}: {len(audio_data)} bytes")
+                            break
+            except Exception as pattern_error:
+                logger.error(f"Pattern extraction also failed for queued request {request_id}: {pattern_error}")
+                audio_data = None
+
+            # Build minimal FormData if we at least have audio_data
             form_data = None
-    else:
-        # For non-multipart requests, use request body size
-        file_size = len(request_body)
-    
+            if audio_data is not None:
+                form_data = aiohttp.FormData()
+                filename = f"audio_{int(time.time())}.wav"
+                form_data.add_field('file', audio_data, filename=filename, content_type='audio/wav')
+                form_data.add_field('response_format', 'srt')  # default when we cannot parse
+
+            # If still no audio_data, leave file_size as original request_body length
+            # form_data may remain None and process_request_on_backend will send raw body
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     queued_request = QueuedRequest(
         request_id=request_id,
         request=request,
@@ -492,14 +637,15 @@ async def add_request_to_queue(request: web.Request, request_body: bytes) -> asy
         form_data=form_data,
         future=future,
         timestamp=asyncio.get_event_loop().time(),
-        file_size=file_size
+        file_size=file_size,
+        audio_data=audio_data
     )
-    
+
     REQUEST_QUEUE.append(queued_request)
     logger.info(f"Added request {request_id} to queue. Queue length: {len(REQUEST_QUEUE)}")
     if file_size:
         logger.info(f"Request {request_id} file size: {file_size / (1024*1024):.2f}MB")
-    return future
+    return future, request_id
 
 async def process_queue():
     """Process requests from the queue when backends become available"""
@@ -553,46 +699,105 @@ def calculate_request_timeout(file_size: Optional[int]) -> int:
     else:
         return REQUEST_TIMEOUT  # 60 minutes
 
-async def process_queued_request(backend: str, queued_request: QueuedRequest):
-    """Process a single queued request on a specific backend"""
-    try:
-        # Process request with progressive timeout
-        timeout = calculate_request_timeout(queued_request.file_size)
-        logger.info(f"Processing request {queued_request.request_id} with timeout {timeout}s")
-        
-        result = await asyncio.wait_for(
-            process_request_on_backend(backend, queued_request.request, queued_request.request_body, queued_request.form_data),
-            timeout=timeout
-        )
-        
-        # Fulfill the future
-        queued_request.future.set_result(result)
-        
-    except asyncio.TimeoutError:
-        logger.error(f"Request {queued_request.request_id} timed out on backend {backend}")
-        queued_request.future.set_exception(
-            web.HTTPGatewayTimeout(reason=f"Request timed out on backend {backend}")
-        )
-    except Exception as e:
-        logger.error(f"Error processing request {queued_request.request_id} on backend {backend}: {e}")
-        queued_request.future.set_exception(
-            web.HTTPInternalServerError(reason=f"Error processing request: {str(e)}")
-        )
-    finally:
-        # Clean up
-        if backend in ACTIVE_REQUESTS:
-            del ACTIVE_REQUESTS[backend]
-        BACKEND_BUSY[backend] = False
-        logger.info(f"Backend {backend} is now free")
+async def process_queued_request_with_retry(backend: str, queued_request: QueuedRequest, max_retries: int = 2):
+    """Process a single queued request on a specific backend with retry logic"""
+    original_backend = backend
+    tried_backends = [backend]
 
-async def process_request_on_backend(backend: str, request: web.Request, request_body: bytes, form_data: Optional[aiohttp.FormData] = None) -> web.Response:
+    for attempt in range(max_retries + 1):
+        try:
+            # Process request with progressive timeout
+            timeout = calculate_request_timeout(queued_request.file_size)
+            if attempt == 0:
+                logger.info(f"Processing request {queued_request.request_id} with timeout {timeout}s on backend {backend}")
+            else:
+                logger.info(f"Retry attempt {attempt} for request {queued_request.request_id} on backend {backend}")
+
+            result = await asyncio.wait_for(
+                process_request_on_backend(backend, queued_request.request, queued_request.request_body, queued_request.form_data, queued_request.audio_data),
+                timeout=timeout
+            )
+
+            # Success! Fulfill the future
+            queued_request.future.set_result(result)
+            logger.info(f"Request {queued_request.request_id} completed successfully on backend {backend}" +
+                       (f" (attempt {attempt})" if attempt > 0 else ""))
+            # Make sure backend is marked as not busy
+            BACKEND_BUSY[backend] = False
+            logger.info(f"🔓 Backend {backend} marked as available after completing request {queued_request.request_id}")
+            return
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Request {queued_request.request_id} timed out on backend {backend} (attempt {attempt})")
+            if attempt < max_retries:
+                # Mark current backend as temporarily unhealthy and try a different one
+                BACKEND_STATUS[backend] = False
+                logger.info(f"Marked backend {backend} as temporarily unhealthy due to timeout")
+
+                # Try to find a different healthy backend
+                new_backend = get_idle_backend()
+                if new_backend and new_backend not in tried_backends:
+                    tried_backends.append(new_backend)
+                    backend = new_backend
+                    continue
+            else:
+                queued_request.future.set_exception(
+                    web.HTTPGatewayTimeout(reason=f"Request timed out after {attempt + 1} attempts")
+                )
+                break
+
+        except Exception as e:
+            error_msg = str(e)
+            is_connection_error = any(keyword in error_msg.lower() for keyword in
+                                     ['connection refused', 'connection reset', 'connection failed',
+                                      'connect call failed', 'max retries exceeded'])
+
+            if is_connection_error and attempt < max_retries:
+                logger.warning(f"Request {queued_request.request_id} failed with connection error on backend {backend}: {error_msg} (attempt {attempt})")
+
+                # Mark current backend as temporarily unhealthy
+                BACKEND_STATUS[backend] = False
+                logger.info(f"Marked backend {backend} as temporarily unhealthy due to connection error")
+
+                # Try to find a different healthy backend
+                new_backend = get_idle_backend()
+                if new_backend and new_backend not in tried_backends:
+                    tried_backends.append(new_backend)
+                    backend = new_backend
+                    logger.info(f"Retrying request {queued_request.request_id} on different backend {backend}")
+                    continue
+                else:
+                    logger.error(f"No alternative backend available for retry of request {queued_request.request_id}")
+                    queued_request.future.set_exception(
+                        web.HTTPInternalServerError(reason=f"All backends failed or busy after {attempt + 1} attempts: {error_msg}")
+                    )
+                    break
+            else:
+                logger.error(f"Request {queued_request.request_id} failed on backend {backend}: {error_msg} (attempt {attempt})")
+                queued_request.future.set_exception(
+                    web.HTTPInternalServerError(reason=f"Error processing request: {error_msg}")
+                )
+                break
+
+    # Clean up - note that we might be using a different backend than the original
+    final_backend = backend if attempt < max_retries else original_backend
+    if final_backend in ACTIVE_REQUESTS:
+        del ACTIVE_REQUESTS[final_backend]
+    BACKEND_BUSY[final_backend] = False
+    logger.info(f"Backend {final_backend} is now free (request failed after retries)")
+
+async def process_queued_request(backend: str, queued_request: QueuedRequest):
+    """Process a single queued request on a specific backend (wrapper for compatibility)"""
+    await process_queued_request_with_retry(backend, queued_request)
+
+async def process_request_on_backend(backend: str, request: web.Request, request_body: bytes, form_data: Optional[aiohttp.FormData] = None, audio_data: Optional[bytes] = None) -> web.Response:
     """Process a request on a specific backend"""
     try:
         # Use progressive connection timeout based on file size
         file_size = len(request_body) if request_body else 0
-        connect_timeout = 30  # Base connection timeout
+        connect_timeout = 600  # 增加到600秒（10分钟），与master_process保持一致
         total_timeout = calculate_request_timeout(file_size)
-        
+
         # Create session with longer timeouts for large files
         timeout = aiohttp.ClientTimeout(
             total=total_timeout,
@@ -600,20 +805,46 @@ async def process_request_on_backend(backend: str, request: web.Request, request
             sock_connect=connect_timeout,
             sock_read=total_timeout
         )
-        
+
         async with ClientSession(timeout=timeout) as session:
             # Prepare headers
             headers = {}
             for key, value in request.headers.items():
                 if key.lower() not in ['content-length', 'host']:
                     headers[key] = value
-            
+
             # Forward request
             if form_data:
+                # For pre-built FormData, ensure proper Content-Type
+                if 'Content-Type' in headers:
+                    del headers['Content-Type']  # Let aiohttp set the correct Content-Type with boundary
                 # Use pre-parsed FormData for multipart requests
                 async with session.post(
                     f"{backend}/inference",
                     data=form_data,
+                    headers=headers
+                ) as response:
+                    response_data = await response.read()
+                    return web.Response(
+                        body=response_data,
+                        status=response.status,
+                        headers={"Content-Type": response.headers.get("Content-Type", "application/json")}
+                    )
+            elif audio_data is not None:
+                # Use pre-extracted audio data for multipart requests
+                # Create new FormData with the audio data (SRT-only)
+                multipart_data = aiohttp.FormData()
+                filename = f"audio_{int(time.time())}.wav"
+                multipart_data.add_field('file', audio_data, filename=filename, content_type='audio/wav')
+                multipart_data.add_field('response_format', 'srt')  # Always SRT
+
+                # Set proper Content-Type header with boundary
+                if 'Content-Type' in headers:
+                    del headers['Content-Type']  # Let aiohttp set the correct Content-Type with boundary
+
+                async with session.post(
+                    f"{backend}/inference",
+                    data=multipart_data,
                     headers=headers
                 ) as response:
                     response_data = await response.read()
@@ -636,7 +867,16 @@ async def process_request_on_backend(backend: str, request: web.Request, request
                         headers={"Content-Type": response.headers.get("Content-Type", "application/json")}
                     )
     except Exception as e:
-        logger.error(f"Error forwarding request to backend {backend}: {e}")
+        error_msg = str(e)
+        is_connection_error = any(keyword in error_msg.lower() for keyword in
+                                 ['server disconnected', 'connection refused', 'connection reset',
+                                  'connection failed', 'connect call failed', 'max retries exceeded'])
+
+        if is_connection_error:
+            logger.error(f"Backend {backend} connection error: {error_msg} - marking as temporarily unhealthy")
+            BACKEND_STATUS[backend] = False
+        else:
+            logger.error(f"Error forwarding request to backend {backend}: {e}")
         raise
 
 async def inference_handler(request):
@@ -655,10 +895,12 @@ async def inference_handler(request):
 
     try:
         request_id = str(uuid.uuid4())
-        logger.info(f"Received inference request {request_id}")
-        logger.info(f"Request headers: {dict(request.headers)}")
-        logger.info(f"Request content length: {request.content_length}")
-        logger.info(f"Request content type: {request.headers.get('Content-Type')}")
+        logger.info(f"🔥 Received inference request {request_id}")
+        logger.info(f"📋 Request headers: {dict(request.headers)}")
+        logger.info(f"📦 Request content length: {request.content_length}")
+        logger.info(f"📦 Request content type: {request.headers.get('Content-Type')}")
+        logger.info(f"🔥 Request remote: {request.remote}")
+        logger.info(f"🔥 User-Agent: {request.headers.get('User-Agent', 'Unknown')}")
 
         # Read request body once
         try:
@@ -705,22 +947,51 @@ async def inference_handler(request):
         if 'multipart/form-data' in content_type:
             # Parse multipart to extract the audio file
             try:
-                logger.info("Parsing multipart data to extract audio file...")
+                logger.info(f"🔍 {request_id} Parsing multipart data to extract audio file...")
+                logger.debug(f"🔍 {request_id} Content-Type: {content_type}")
 
                 # Use the already read request_body to manually parse multipart data
-                # Extract boundary from Content-Type header
+                # Extract boundary from Content-Type header - consistent with queue processing
                 import re
-                boundary_match = re.search(r'boundary=(.+)', content_type)
+                boundary_match = re.search(r'boundary\s*=\s*([^;\s]+)', content_type, re.IGNORECASE)
                 if not boundary_match:
-                    logger.error("No boundary found in Content-Type header")
-                    raise web.HTTPBadRequest(reason="No boundary found in Content-Type header")
-
-                boundary = boundary_match.group(1)
+                    # Fallback to original pattern for compatibility
+                    boundary_match = re.search(r'boundary=(.+)', content_type)
+                    if boundary_match:
+                        boundary = boundary_match.group(1).strip(' "\'')
+                    else:
+                        logger.error("No boundary found in Content-Type header")
+                        raise web.HTTPBadRequest(reason="No boundary found in Content-Type header")
+                else:
+                    boundary = boundary_match.group(1).strip(' "\'')
                 logger.info(f"Found boundary: {boundary}")
 
                 # Parse multipart data manually
-                audio_data = await parse_multipart_data(request_body, boundary)
-                logger.info(f"Extracted audio file: {len(audio_data)} bytes")
+                try:
+                    audio_data = await parse_multipart_data(request_body, boundary)
+                    logger.info(f"Extracted audio file: {len(audio_data)} bytes")
+                except ValueError as mp_error:
+                    logger.warning(f"First multipart parse attempt failed: {mp_error}")
+                    # Try alternative parsing approach
+                    try:
+                        # Use aiohttp's built-in parsing as fallback
+                        form_data = aiohttp.FormData()
+                        reader = await request.multipart()
+
+                        while True:
+                            field = await reader.next()
+                            if field is None:
+                                break
+
+                            if field.filename:
+                                # File field - read the content
+                                content = await field.read()
+                                logger.info(f"Extracted audio file via fallback: {len(content)} bytes")
+                                audio_data = content
+                                break
+                    except Exception as fallback_error:
+                        logger.error(f"Fallback parsing also failed: {fallback_error}")
+                        raise web.HTTPBadRequest(reason=f"Failed to parse multipart data: {mp_error}")
 
             except Exception as e:
                 logger.error(f"Failed to parse multipart data: {e}")
@@ -759,14 +1030,20 @@ async def inference_handler(request):
 
         # Check if we should use distributed processing
         should_use_distributed = await distributed_processor.should_distribute(
-            len(audio_data), len(available_backends)
+            len(audio_data), len(healthy_backends)
         )
 
-        if should_use_distributed and len(available_backends) > 1:
-            logger.info(f"Using distributed processing for request {request_id}")
-            return await process_distributed_request(request, request_body, available_backends, content_type)
+        if should_use_distributed and len(healthy_backends) > 1:
+            # Check if we have enough available workers for distributed processing
+            if len(available_backends) > 1:
+                logger.info(f"🔄 Using distributed processing for request {request_id} with {len(available_backends)} workers")
+                return await process_distributed_request(request, request_body, available_backends, content_type)
+            else:
+                # Not enough available workers, queue the request for distributed processing
+                logger.info(f"🔄 Request {request_id} qualifies for distributed processing but not enough workers available. Queueing for distributed processing.")
+                return await queue_for_distributed_processing(request, request_body, healthy_backends, content_type)
         else:
-            logger.info(f"Using single worker processing for request {request_id}")
+            logger.info(f"🔧 Using single worker processing for request {request_id} with {len(available_backends)} workers")
             return await process_single_worker_request(request, request_body, available_backends)
 
     except web.HTTPException:
@@ -786,8 +1063,8 @@ async def process_distributed_request(request, request_body: bytes, available_ba
     # Create session with timeout
     timeout_obj = aiohttp.ClientTimeout(
         total=timeout,
-        connect=30,
-        sock_connect=30,
+        connect=600,  # 增加到600秒，与其他超时保持一致
+        sock_connect=600,
         sock_read=timeout
     )
 
@@ -829,6 +1106,110 @@ async def process_distributed_request(request, request_body: bytes, available_ba
         logger.error(f"Error in distributed processing for request {request_id}: {e}")
         raise web.HTTPInternalServerError(reason=f"Distributed processing failed: {str(e)}")
 
+async def queue_for_distributed_processing(request, request_body: bytes, healthy_backends: List[str], content_type: str):
+    """Queue a request for distributed processing when workers are busy"""
+    request_id = str(uuid.uuid4())
+    timeout = calculate_request_timeout(len(request_body))
+    logger.info(f"Queueing distributed request {request_id} with timeout {timeout}s")
+
+    # Create a distributed request queue entry
+    future = asyncio.get_event_loop().create_future()
+
+    # Add to a special distributed processing queue
+    if not hasattr(queue_for_distributed_processing, 'distributed_queue'):
+        queue_for_distributed_processing.distributed_queue = deque(maxlen=MAX_QUEUE_SIZE)
+
+    distributed_request = {
+        'request_id': request_id,
+        'request': request,
+        'request_body': request_body,
+        'healthy_backends': healthy_backends,
+        'content_type': content_type,
+        'future': future,
+        'timestamp': asyncio.get_event_loop().time()
+    }
+
+    if len(queue_for_distributed_processing.distributed_queue) >= MAX_QUEUE_SIZE:
+        raise web.HTTPServiceUnavailable(reason="Distributed processing queue is full")
+
+    queue_for_distributed_processing.distributed_queue.append(distributed_request)
+    logger.info(f"Added distributed request {request_id} to queue. Queue length: {len(queue_for_distributed_processing.distributed_queue)}")
+
+    # Start distributed queue processor if not already running
+    if not hasattr(queue_for_distributed_processing, 'processor_task') or queue_for_distributed_processing.processor_task.done():
+        queue_for_distributed_processing.processor_task = asyncio.create_task(process_distributed_queue())
+
+    try:
+        # Wait for the distributed processing to complete
+        result = await asyncio.wait_for(future, timeout=timeout)
+        logger.info(f"Distributed queued request {request_id} completed successfully")
+        return result
+    except asyncio.TimeoutError:
+        logger.error(f"Distributed queued request {request_id} timed out")
+        raise web.HTTPGatewayTimeout(reason="Distributed processing timed out in queue")
+    except Exception as e:
+        logger.error(f"Error with distributed queued request {request_id}: {e}")
+        if isinstance(e, web.HTTPException):
+            raise
+        raise web.HTTPInternalServerError(reason=f"Error in distributed queue processing: {str(e)}")
+
+async def process_distributed_queue():
+    """Process distributed requests from the queue when enough workers become available"""
+    logger.info("Distributed queue processor task started")
+
+    while True:
+        try:
+            # Check if there are queued distributed requests
+            if not hasattr(queue_for_distributed_processing, 'distributed_queue') or not queue_for_distributed_processing.distributed_queue:
+                await asyncio.sleep(0.1)
+                continue
+
+            # Check if we have enough available workers for distributed processing
+            available_backends = get_available_backends()
+            if len(available_backends) <= 1:
+                await asyncio.sleep(0.5)  # Wait longer for distributed processing
+                continue
+
+            # Get the next distributed request from queue
+            distributed_request = queue_for_distributed_processing.distributed_queue.popleft()
+            request_id = distributed_request['request_id']
+            logger.info(f"Processing distributed queued request {request_id} with {len(available_backends)} workers")
+
+            # Process the distributed request asynchronously
+            asyncio.create_task(
+                process_distributed_queued_request(distributed_request, available_backends)
+            )
+
+        except Exception as e:
+            logger.error(f"Error in distributed queue processor: {e}")
+            await asyncio.sleep(1)
+
+async def process_distributed_queued_request(distributed_request: dict, available_backends: List[str]):
+    """Process a single distributed queued request"""
+    request_id = distributed_request['request_id']
+    request = distributed_request['request']
+    request_body = distributed_request['request_body']
+    content_type = distributed_request['content_type']
+    future = distributed_request['future']
+
+    try:
+        timeout = calculate_request_timeout(len(request_body))
+        logger.info(f"Processing distributed queued request {request_id} with timeout {timeout}s")
+
+        result = await asyncio.wait_for(
+            process_distributed_request(request, request_body, available_backends, content_type),
+            timeout=timeout
+        )
+
+        # Success! Fulfill the future
+        future.set_result(result)
+        logger.info(f"Distributed queued request {request_id} completed successfully")
+
+    except Exception as e:
+        logger.error(f"Error processing distributed queued request {request_id}: {e}")
+        if not future.done():
+            future.set_exception(e)
+
 async def process_single_worker_request(request, request_body: bytes, available_backends: List[str]):
     """Process request using single worker (original logic)"""
     request_id = str(uuid.uuid4())
@@ -843,13 +1224,14 @@ async def process_single_worker_request(request, request_body: bytes, available_
             # Mark backend as busy
             BACKEND_BUSY[backend] = True
 
-            # Process request immediately
+            # Process request immediately (no retry for direct requests)
             result = await asyncio.wait_for(
                 process_request_on_backend(backend, request, request_body),
                 timeout=timeout
             )
             BACKEND_BUSY[backend] = False
             logger.info(f"Request {request_id} completed immediately on backend {backend}")
+            logger.info(f"🔓 Backend {backend} marked as available after completing immediate request {request_id}")
             return result
         except asyncio.TimeoutError:
             logger.error(f"Request {request_id} timed out on backend {backend}")
@@ -864,19 +1246,19 @@ async def process_single_worker_request(request, request_body: bytes, available_
     # No idle backend available, add to queue
     logger.info(f"No idle backend available, queueing request {request_id}")
     try:
-        future = await add_request_to_queue(request, request_body)
-        logger.info(f"Waiting for queued request {request_id} to be processed")
+        future, queued_request_id = await add_request_to_queue(request, request_body)
+        logger.info(f"Waiting for queued request {queued_request_id} to be processed")
 
         # Wait for the result with progressive timeout
         result = await asyncio.wait_for(future, timeout=timeout)
-        logger.info(f"Queued request {request_id} completed successfully")
+        logger.info(f"Queued request {queued_request_id} completed successfully")
         return result
 
     except asyncio.TimeoutError:
-        logger.error(f"Queued request {request_id} timed out")
+        logger.error(f"Queued request {queued_request_id} timed out")
         raise web.HTTPGatewayTimeout(reason="Request timed out in queue")
     except Exception as e:
-        logger.error(f"Error with queued request {request_id}: {e}")
+        logger.error(f"Error with queued request {queued_request_id}: {e}")
         if isinstance(e, web.HTTPException):
             raise
         raise web.HTTPInternalServerError(reason=f"Error processing queued request: {str(e)}")
@@ -1023,7 +1405,7 @@ async def stats_handler(request):
             service: {
                 "healthy": BACKEND_STATUS[service],
                 "busy": BACKEND_BUSY.get(service, False),
-                "active_request": ACTIVE_REQUESTS.get(service, {}).get('request_id') if service in ACTIVE_REQUESTS else None
+                "active_request": getattr(ACTIVE_REQUESTS.get(service), 'request_id', None) if service in ACTIVE_REQUESTS else None
             }
             for service in BACKEND_SERVICES
         },
@@ -1055,7 +1437,7 @@ async def health_handler(request):
             service: {
                 "healthy": BACKEND_STATUS[service],
                 "busy": BACKEND_BUSY.get(service, False),
-                "active_request": ACTIVE_REQUESTS.get(service, {}).get('request_id') if service in ACTIVE_REQUESTS else None
+                "active_request": getattr(ACTIVE_REQUESTS.get(service), 'request_id', None) if service in ACTIVE_REQUESTS else None
             }
             for service in BACKEND_SERVICES
         }

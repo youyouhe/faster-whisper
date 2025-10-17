@@ -75,6 +75,15 @@ class DistributedProcessor:
         self.overlap_seconds = float(os.getenv("OVERLAP_SECONDS", "2.0"))  # seconds, configurable
         self.min_chunk_size_mb = float(os.getenv("MIN_CHUNK_SIZE_MB", "1.0"))  # MB, minimum chunk size
 
+        # Add concurrency control
+        self.max_concurrent_distributed = int(os.getenv("MAX_CONCURRENT_DISTRIBUTED", "3"))  # Allow up to 3 concurrent distributed tasks
+        self.current_distributed_count = 0
+        self.distributed_lock = asyncio.Lock()
+
+        # Track busy backends during distributed processing
+        self.busy_backends = set()
+        self.backend_lock = asyncio.Lock()
+
     async def should_distribute(self, file_size_bytes: int, available_workers: int) -> bool:
         """
         Determine if file should be distributed across workers
@@ -87,9 +96,22 @@ class DistributedProcessor:
             True if should distribute, False otherwise
         """
         file_size_mb = file_size_bytes / (1024 * 1024)
-        should_distribute = file_size_mb >= self.distributed_threshold_mb and available_workers > 1
+
+        # Check basic conditions
+        basic_conditions = file_size_mb >= self.distributed_threshold_mb and available_workers > 1
+
+        # Check concurrent distributed processing limit
+        async with self.distributed_lock:
+            concurrent_ok = self.current_distributed_count < self.max_concurrent_distributed
+            if basic_conditions and not concurrent_ok:
+                logger.info(f"File size: {file_size_mb:.2f}MB qualifies for distribution, but max concurrent distributed processing ({self.max_concurrent_distributed}) reached")
+                logger.info("Falling back to single worker processing")
+                return False
+
+        should_distribute = basic_conditions and concurrent_ok
 
         logger.info(f"File size: {file_size_mb:.2f}MB, Available workers: {available_workers}")
+        logger.info(f"Current distributed processing: {self.current_distributed_count}/{self.max_concurrent_distributed}")
         logger.info(f"Should distribute: {should_distribute}")
 
         return should_distribute
@@ -144,83 +166,117 @@ class DistributedProcessor:
         Returns:
             Merged SRT content
         """
-        logger.info(f"Starting distributed processing with {len(available_backends)} workers")
-
-        # Extract audio data from multipart request body first
         try:
-            # Extract boundary from Content-Type header
-            content_type = headers.get('Content-Type', '')
-            import re
-            boundary_match = re.search(r'boundary=(.+)', content_type)
-            if not boundary_match:
-                logger.error("No boundary found in Content-Type header")
-                raise RuntimeError("No boundary found in Content-Type header")
+            logger.info(f"Starting distributed processing with {len(available_backends)} workers")
 
-            boundary = boundary_match.group(1)
-            logger.info(f"Found boundary: {boundary}")
+            # Extract audio data from multipart request body first
+            try:
+                # Extract boundary from Content-Type header
+                content_type = headers.get('Content-Type', '')
+                import re
+                boundary_match = re.search(r'boundary=(.+)', content_type)
+                if not boundary_match:
+                    logger.error("No boundary found in Content-Type header")
+                    raise RuntimeError("No boundary found in Content-Type header")
 
-            # Parse multipart data to extract audio file
-            audio_data = await parse_multipart_data(request_body, boundary)
-            logger.info(f"Extracted audio file: {len(audio_data)} bytes")
+                boundary = boundary_match.group(1)
+                logger.info(f"Found boundary: {boundary}")
 
-        except Exception as e:
-            logger.error(f"Failed to extract audio from multipart data: {e}")
-            raise RuntimeError(f"Audio extraction failed: {e}")
+                # Parse multipart data to extract audio file
+                audio_data = await parse_multipart_data(request_body, boundary)
+                logger.info(f"Extracted audio file: {len(audio_data)} bytes")
 
-        # Calculate optimal chunk count based on file size and constraints
-        file_size_mb = len(audio_data) / (1024 * 1024)
-        optimal_chunks = self.calculate_optimal_chunks(file_size_mb, len(available_backends))
+            except Exception as e:
+                logger.error(f"Failed to extract audio from multipart data: {e}")
+                raise RuntimeError(f"Audio extraction failed: {e}")
 
-        # Determine number of workers to use (use calculated optimal chunks)
-        # Use all available workers, but limit to reasonable number to avoid fragmentation
-        max_workers = int(os.getenv("MAX_DISTRIBUTED_WORKERS", str(len(available_backends))))
-        num_workers = min(optimal_chunks, len(available_backends), max_workers)
-        workers_to_use = available_backends[:num_workers]
+            # Calculate optimal chunk count based on file size and constraints
+            file_size_mb = len(audio_data) / (1024 * 1024)
+            optimal_chunks = self.calculate_optimal_chunks(file_size_mb, len(available_backends))
 
-        logger.info(f"Using {num_workers} workers: {workers_to_use}")
+            # Determine number of workers to use (use calculated optimal chunks)
+            # Use all available workers, but limit to reasonable number to avoid fragmentation
+            max_workers = int(os.getenv("MAX_DISTRIBUTED_WORKERS", str(len(available_backends))))
+            num_workers = min(optimal_chunks, len(available_backends), max_workers)
+            workers_to_use = available_backends[:num_workers]
 
-        # Split audio file
-        try:
-            audio_file = io.BytesIO(audio_data)
-            chunk_data_list = self.audio_splitter.split_with_overlap(
-                audio_file, num_workers, self.overlap_seconds
-            )
+            logger.info(f"Using {num_workers} workers: {workers_to_use}")
 
-            # Extract chunk data and timing information
-            chunk_data = [chunk[0] for chunk in chunk_data_list]
-            chunk_timings = [(chunk[1], chunk[2]) for chunk in chunk_data_list]
+            # Acquire distributed processing lock
+            async with self.distributed_lock:
+                if self.current_distributed_count >= self.max_concurrent_distributed:
+                    raise RuntimeError(f"Maximum concurrent distributed processing ({self.max_concurrent_distributed}) reached")
 
-            logger.info(f"Split audio into {len(chunk_data)} chunks")
+                # Mark backends as busy before starting processing
+                async with self.backend_lock:
+                    for backend in workers_to_use:
+                        self.busy_backends.add(backend)
+                        logger.info(f"Marked backend {backend} as busy for distributed processing")
 
-        except Exception as e:
-            logger.error(f"Failed to split audio: {e}")
-            raise RuntimeError(f"Audio splitting failed: {e}")
+                # Increment counter
+                self.current_distributed_count += 1
+                logger.info(f"Starting distributed processing. Active distributed jobs: {self.current_distributed_count}")
 
-        # Process chunks in parallel
-        try:
-            chunk_results = await self._process_chunks_parallel(
-                chunk_data, workers_to_use, session, headers
-            )
+            # Split audio file
+            try:
+                audio_file = io.BytesIO(audio_data)
+                chunk_data_list = self.audio_splitter.split_with_overlap(
+                    audio_file, num_workers, self.overlap_seconds
+                )
 
-            # Debug: check chunk_results
-            logger.info(f"DEBUG: Received {len(chunk_results)} chunk results")
-            for i, result in enumerate(chunk_results):
-                logger.info(f"DEBUG: Chunk {i} result length: {len(result) if result else 'None/Empty'}")
+                # Extract chunk data and timing information
+                chunk_data = [chunk[0] for chunk in chunk_data_list]
+                chunk_timings = [(chunk[1], chunk[2]) for chunk in chunk_data_list]
 
-            # Merge results
-            final_srt = self.srt_merger.merge_chunk_results(chunk_results, chunk_timings)
+                logger.info(f"Split audio into {len(chunk_data)} chunks")
 
-            # Debug: check final result
-            logger.info(f"DEBUG: Final SRT length: {len(final_srt) if final_srt else 'None/Empty'}")
-            if final_srt:
-                logger.info("DEBUG: Final SRT preview (first 200 chars):\n" + final_srt[:200])
+            except Exception as e:
+                logger.error(f"Failed to split audio: {e}")
+                raise RuntimeError(f"Audio splitting failed: {e}")
 
-            logger.info("Distributed processing completed successfully")
-            return final_srt
+            # Process chunks in parallel
+            try:
+                chunk_results = await self._process_chunks_parallel(
+                    chunk_data, workers_to_use, session, headers
+                )
 
-        except Exception as e:
-            logger.error(f"Failed during distributed processing: {e}")
-            raise RuntimeError(f"Distributed processing failed: {e}")
+                # Debug: check chunk_results
+                logger.info(f"DEBUG: Received {len(chunk_results)} chunk results")
+                for i, result in enumerate(chunk_results):
+                    logger.info(f"DEBUG: Chunk {i} result length: {len(result) if result else 'None/Empty'}")
+
+                # Merge results
+                final_srt = self.srt_merger.merge_chunk_results(chunk_results, chunk_timings)
+
+                # Debug: check final result
+                logger.info(f"DEBUG: Final SRT length: {len(final_srt) if final_srt else 'None/Empty'}")
+                if final_srt:
+                    logger.info("DEBUG: Final SRT preview (first 200 chars):\n" + final_srt[:200])
+
+                logger.info("Distributed processing completed successfully")
+                return final_srt
+
+            except Exception as e:
+                logger.error(f"Failed during distributed processing: {e}")
+                # Don't immediately re-raise, let the finally block clean up first
+                raise RuntimeError(f"Distributed processing failed: {e}")
+
+        finally:
+            # Always decrement the counter and clear busy backends, even if an exception occurred
+            async with self.distributed_lock:
+                self.current_distributed_count -= 1
+                logger.info(f"Distributed processing completed. Active distributed jobs: {self.current_distributed_count}")
+
+            # Clear busy backends - this is critical for proper cleanup
+            async with self.backend_lock:
+                cleared_backends = []
+                for backend in workers_to_use:
+                    if backend in self.busy_backends:
+                        self.busy_backends.remove(backend)
+                        cleared_backends.append(backend)
+                        logger.info(f"Marked backend {backend} as available after distributed processing")
+                if cleared_backends:
+                    logger.info(f"Cleared {len(cleared_backends)} backends from busy state: {cleared_backends}")
 
     async def _process_chunks_parallel(
         self,
@@ -253,17 +309,25 @@ class DistributedProcessor:
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Check for exceptions
+            # Check for exceptions and log detailed errors
+            failed_chunks = []
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
-                    logger.error(f"Chunk {i} processing failed: {result}")
-                    raise RuntimeError(f"Chunk {i} failed: {result}")
+                    logger.error(f"Chunk {i} processing failed on worker {workers[i]}: {result}")
+                    failed_chunks.append(i)
+
+            # If any chunks failed, we still want to continue with successful ones
+            if failed_chunks:
+                logger.error(f"Failed chunks: {failed_chunks}, continuing with successful chunks")
+                # For now, we'll raise an error to maintain consistency
+                raise RuntimeError(f"Some chunks failed: {failed_chunks}")
 
             logger.info("All chunks processed successfully")
             return results
 
         except Exception as e:
             logger.error(f"Error processing chunks in parallel: {e}")
+            # Don't immediately clear busy backends here, let the finally block in process_distributed handle it
             raise
 
     async def _process_single_chunk(
@@ -366,5 +430,8 @@ class DistributedProcessor:
             "distributed_threshold_mb": self.distributed_threshold_mb,
             "min_chunk_size_mb": self.min_chunk_size_mb,
             "overlap_seconds": self.overlap_seconds,
-            "max_workers": os.getenv("MAX_DISTRIBUTED_WORKERS", "auto")
+            "max_workers": os.getenv("MAX_DISTRIBUTED_WORKERS", "auto"),
+            "max_concurrent_distributed": self.max_concurrent_distributed,
+            "current_distributed_count": self.current_distributed_count,
+            "busy_backends": list(self.busy_backends)
         }
