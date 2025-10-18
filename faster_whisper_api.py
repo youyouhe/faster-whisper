@@ -671,7 +671,7 @@ async def startup_event():
     print(f"Initializing {model_size} model on device {device}...")
     import time
     model_init_start = time.time()
-    model = WhisperModel(model_size, device=device, compute_type="int8")
+    model = WhisperModel(model_size, device=device, compute_type="float32")
     model_init_time = time.time() - model_init_start
     print(f"Model initialized successfully in {model_init_time:.2f}s!")
 
