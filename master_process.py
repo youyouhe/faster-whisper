@@ -376,7 +376,7 @@ class MasterProcess:
 
             # 将任务放入工作进程的队列
             try:
-                worker.task_queue.put(task, timeout=5.0)
+                worker.task_queue.put(task, timeout=600.0)  # 增加到600秒（10分钟）
                 logger.info(f"Task {task_id} successfully queued for worker {worker.worker_id}")
             except Exception as e:
                 logger.error(f"Failed to queue task {task_id} for worker {worker.worker_id}: {e}")
@@ -401,7 +401,7 @@ class MasterProcess:
     async def _listen_for_worker_result(self, worker: WorkerInfo, task_id: str):
         """监听特定工作进程的任务结果"""
         try:
-            timeout = 300  # 5分钟超时
+            timeout = 600  # 10分钟超时，与任务队列超时保持一致
             start_time = time.time()
 
             while time.time() - start_time < timeout:

@@ -233,7 +233,7 @@ class UnifiedAPI:
                             raise HTTPException(status_code=500, detail=f"Memory pool not available for GPU {pool_gpu_id}")
 
                 # 等待结果（同步模式）
-                result = await self._wait_for_task_result(task_id, timeout=300)
+                result = await self._wait_for_task_result(task_id, timeout=600)  # 增加到10分钟
 
                 return JSONResponse({
                     "code": 0,
