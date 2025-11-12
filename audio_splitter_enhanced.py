@@ -6,6 +6,7 @@ Enhanced Audio Splitter with Data Validation and Smart Split Point Selection
 
 import io
 import logging
+import struct
 import numpy as np
 import av
 from typing import List, Tuple, BinaryIO, Union
@@ -139,6 +140,32 @@ class EnhancedAudioSplitter:
             logger.exception(e)
             return False, None, decode_info
 
+    def validate_audio_file(self, file_path: str, context: str = "unknown") -> Tuple[bool, dict]:
+        """
+        Validate audio file from file path
+
+        Args:
+            file_path: Path to audio file
+            context: Context for validation
+
+        Returns:
+            Tuple of (is_valid, validation_info)
+        """
+        try:
+            with open(file_path, 'rb') as f:
+                audio_data = f.read()
+            return self.validate_audio_data(audio_data, context)
+        except Exception as e:
+            validation_info = {
+                "context": context,
+                "file_path": file_path,
+                "is_valid": False,
+                "issues": [f"Failed to read file: {str(e)}"],
+                "warnings": []
+            }
+            logger.error(f"[{context}] File validation failed: {str(e)}")
+            return False, validation_info
+
     def calculate_smart_chunks(self, audio_duration: float, available_workers: int,
                              file_size_mb: float, min_chunk_duration: float = 60.0) -> int:
         """
@@ -251,10 +278,19 @@ class EnhancedAudioSplitter:
         Enhanced VAD-guided splitting with better error handling
         """
         try:
+            # Decode audio first
+            success, audio, decode_info = self.decode_audio_safely(input_file, context)
+            if not success:
+                raise RuntimeError(f"Audio decoding failed: {decode_info['error']}")
+
+            # Get total samples for calculation
+            total_samples = len(audio)
+
             # Get speech timestamps using VAD
             speech_timestamps = get_speech_timestamps(
-                audio_file_or_path=input_file,
-                vad_options=self.vad_options
+                audio=audio,
+                vad_options=self.vad_options,
+                sampling_rate=self.sampling_rate
             )
 
             if not speech_timestamps:
@@ -264,7 +300,7 @@ class EnhancedAudioSplitter:
             logger.info(f"[{context}] VAD detected {len(speech_timestamps)} speech segments")
 
             # Calculate total duration from VAD results
-            total_duration = speech_timestamps[-1]['end'] / self.speech_timestamps[0]['sample_rate']
+            total_duration = speech_timestamps[-1]['end'] / self.sampling_rate
 
             # Use existing VAD split point logic
             split_points = self._find_vad_split_points_enhanced(
@@ -286,7 +322,7 @@ class EnhancedAudioSplitter:
             chunk_data = self._encode_audio_chunk(
                 audio[start_sample:end_sample], 0, context
             )
-            chunks.append((chunk_data, 0.0, first_split['time']))
+            chunks.append((chunk_data, 0.0, first_split['start_time']))
 
             # Add middle chunks
             for i in range(len(split_points) - 1):
@@ -296,7 +332,7 @@ class EnhancedAudioSplitter:
                 chunk_data = self._encode_audio_chunk(
                     audio[start_split['sample']:end_split['sample']], i + 1, context
                 )
-                chunks.append((chunk_data, start_split['time'], end_split['time']))
+                chunks.append((chunk_data, start_split['start_time'], end_split['start_time']))
 
             # Add last chunk from last split point to end
             last_split = split_points[-1]
@@ -306,7 +342,7 @@ class EnhancedAudioSplitter:
             chunk_data = self._encode_audio_chunk(
                 audio[start_sample:end_sample], len(split_points), context
             )
-            chunks.append((chunk_data, last_split['time'], total_duration))
+            chunks.append((chunk_data, last_split['start_time'], total_duration))
 
             return chunks
 
@@ -322,12 +358,12 @@ class EnhancedAudioSplitter:
         """
         # Find silences between speech segments
         silences = []
-        min_silence_duration = 1.0  # Increased minimum silence duration
+        min_silence_duration = 1.0  # Start with 1 second, will adjust if needed for balance
 
         for i in range(len(speech_segments) - 1):
             current_end = speech_segments[i]["end"]
             next_start = speech_segments[i + 1]["start"]
-            silence_duration = (next_start - current_end) / speech_segments[0]["sample_rate"]
+            silence_duration = (next_start - current_end) / self.sampling_rate
 
             if silence_duration >= min_silence_duration:
                 silences.append({
@@ -335,8 +371,8 @@ class EnhancedAudioSplitter:
                     "duration": silence_duration,
                     "start_sample": current_end,
                     "end_sample": next_start,
-                    "start_time": current_end / speech_segments[0]["sample_rate"],
-                    "end_time": next_start / speech_segments[0]["sample_rate"]
+                    "start_time": current_end / self.sampling_rate,
+                    "end_time": next_start / self.sampling_rate
                 })
 
         logger.info(f"[{context}] Found {len(silences)} suitable silences (>= {min_silence_duration}s)")
@@ -361,59 +397,87 @@ class EnhancedAudioSplitter:
         # Sort silences by duration (prefer longer silences)
         silences.sort(key=lambda x: x['duration'], reverse=True)
 
-        # Calculate target chunk duration
+        # Calculate target chunk duration and tolerance
         target_chunk_duration = total_duration / num_chunks
+        tolerance = target_chunk_duration * 0.4  # Allow 40% tolerance for better balance
         split_points = []
 
-        logger.info(f"[{context}] Target chunk duration: {target_chunk_duration:.2f}s")
+        logger.info(f"[{context}] Target chunk duration: {target_chunk_duration:.2f}s ±{tolerance:.2f}s")
 
-        # Smart split point selection
+        # Smart balanced splitting algorithm
         current_pos = 0.0
-        chunks_created = 0
+        used_silences = set()  # Track used silences to avoid reuse
 
         for chunk_idx in range(num_chunks - 1):
-            target_end_time = current_pos + target_chunk_duration
+            ideal_split_time = current_pos + target_chunk_duration
 
-            # Find the best silence near target position
+            # Find best silence point considering balance
             best_silence = None
-            best_distance = float('inf')
+            best_score = float('inf')
 
-            for silence in silences:
-                # Check if silence is available and not already used
-                if (silence['start_time'] > current_pos and
-                    silence['end_time'] < target_end_time + target_chunk_duration * 0.3):  # Allow some flexibility
+            for i, silence in enumerate(silences):
+                if i in used_silences:
+                    continue  # Skip already used silences
 
-                    distance = abs(silence['sample'] / self.sampling_rate - (current_pos + target_chunk_duration / 2))
+                if silence['start_time'] <= current_pos:
+                    continue  # Silence must be after current position
 
-                    if distance < best_distance:
-                        best_distance = distance
-                        best_silence = silence
+                # Calculate score: distance from ideal + silence quality bonus
+                distance_from_ideal = abs(silence['start_time'] - ideal_split_time)
+                silence_bonus = silence['duration'] * 0.1  # Prefer longer silences
+                score = distance_from_ideal - silence_bonus
+
+                # Only consider if within reasonable range
+                if distance_from_ideal <= tolerance and score < best_score:
+                    best_score = score
+                    best_silence = (i, silence)
 
             if best_silence:
-                # Use the best silence found
-                split_point = best_silence
-                split_points.append(split_point)
-                current_pos = split_point['end_time']
-                chunks_created += 1
-                logger.info(f"[{context] Chunk {chunk_idx+1}: Using silence at {split_point['time']:.2f}s (duration: {split_point['duration']:.2f}s)")
-            else:
-                # No suitable silence, create even split
-                split_time = current_pos + target_chunk_duration
-                split_sample = int(split_time * self.sampling_rate)
+                # Use the selected silence
+                silence_idx, selected_silence = best_silence
+                split_points.append(selected_silence)
+                used_silences.add(silence_idx)
+                current_pos = selected_silence['start_time']
 
-                split_points.append({
-                    'sample': split_sample,
+                chunk_duration = selected_silence['start_time'] - (split_points[-2]['start_time'] if len(split_points) > 1 else 0)
+                logger.info(f"[{context}] Chunk {chunk_idx+1}: {chunk_duration:.2f}s (silence at {selected_silence['start_time']:.2f}s, duration: {selected_silence['duration']:.2f}s)")
+            else:
+                # No suitable silence, create synthetic split for balance
+                split_time = ideal_split_time
+                synthetic_point = {
+                    'sample': int(split_time * self.sampling_rate),
                     'time': split_time,
                     'duration': 0,
                     'synthetic': True
-                })
+                }
+                split_points.append(synthetic_point)
                 current_pos = split_time
-                chunks_created += 1
-                logger.warning(f"[{context] Chunk {chunk_idx+1}: Using synthetic split at {split_time:.2f}s (no suitable silence)")
 
-        logger.info(f"[{context}] Created {chunks_created} VAD-guided chunks out of {num_chunks-1} needed")
+                chunk_duration = split_time - (split_points[-2]['start_time'] if len(split_points) > 1 else 0)
+                logger.warning(f"[{context}] Chunk {chunk_idx+1}: {chunk_duration:.2f}s (synthetic split at {split_time:.2f}s)")
 
-        return split_points[:num_chunks - 1]  # Return only needed split points
+        # Calculate final chunk and check balance
+        final_chunk_duration = total_duration - current_pos
+        logger.info(f"[{context}] Final chunk: {final_chunk_duration:.2f}s")
+
+        # Check if chunks are reasonably balanced
+        chunk_durations = []
+        prev_pos = 0.0
+        for point in split_points:
+            chunk_durations.append(point['start_time'] - prev_pos)
+            prev_pos = point['start_time']
+        chunk_durations.append(final_chunk_duration)
+
+        avg_duration = sum(chunk_durations) / len(chunk_durations)
+        max_variance = max(abs(d - avg_duration) for d in chunk_durations)
+        variance_percent = (max_variance / avg_duration) * 100
+
+        logger.info(f"[{context}] Balance analysis: avg={avg_duration:.2f}s, max variance={max_variance:.2f}s ({variance_percent:.1f}%)")
+
+        if variance_percent > 60:  # If variance is too high, suggest adjusting silence threshold
+            logger.warning(f"[{context}] High variance detected ({variance_percent:.1f}%). Consider reducing silence threshold to 0.5s for better balance")
+
+        return split_points[:num_chunks - 1]
 
     def _split_even_enhanced(self, input_file: Union[str, BinaryIO, bytes],
                            num_chunks: int, overlap_seconds: float,
@@ -536,10 +600,10 @@ class EnhancedAudioSplitter:
 
             if next_start < current_end:
                 overlap = current_end - next_start
-                logger.warning(f"[{context] Overlap detected between chunks {i} and {i+1}: {overlap:.2f}s")
+                logger.warning(f"[{context}] Overlap detected between chunks {i} and {i+1}: {overlap:.2f}s")
             elif next_start > current_end + 0.1:  # Allow 0.1 second gap
                 gap = next_start - current_end
-                logger.warning(f"[{context] Gap detected between chunks {i} and {i+1}: {gap:.2f}s")
+                logger.warning(f"[{context}] Gap detected between chunks {i} and {i+1}: {gap:.2f}s")
 
         # Check chunk sizes
         chunk_sizes = [len(chunk[0]) for chunk in chunks]
@@ -547,7 +611,7 @@ class EnhancedAudioSplitter:
         size_variance = sum((size - avg_size) ** 2 for size in chunk_sizes) / len(chunk_sizes)
 
         if size_variance > avg_size ** 2 * 0.25:  # 25% variance threshold
-            logger.warning(f"[{context] High chunk size variance: avg {avg_size:.0f}, variance {size_variance:.0f}")
+            logger.warning(f"[{context}] High chunk size variance: avg {avg_size:.0f}, variance {size_variance:.0f}")
 
         logger.info(f"[{context}] Split validation completed successfully")
 
