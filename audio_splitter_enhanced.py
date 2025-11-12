@@ -347,7 +347,7 @@ class EnhancedAudioSplitter:
         """
         # Find silences between speech segments
         silences = []
-        min_silence_duration = 1.0  # Start with 1 second, will adjust if needed for balance
+        min_silence_duration = 0.5  # Reduced to 0.5s to find more split points in continuous speech
 
         for i in range(len(speech_segments) - 1):
             current_end = speech_segments[i]["end"]
@@ -442,7 +442,10 @@ class EnhancedAudioSplitter:
                 split_points.append(synthetic_point)
                 current_pos = split_time
 
-                chunk_duration = split_time - (split_points[-2]['start_time'] if len(split_points) > 1 else 0)
+                if len(split_points) > 1:
+                    chunk_duration = split_time - split_points[-2].get('time', split_points[-2].get('start_time', 0))
+                else:
+                    chunk_duration = split_time
                 logger.warning(f"[{context}] Chunk {chunk_idx+1}: {chunk_duration:.2f}s (synthetic split at {split_time:.2f}s)")
 
         # Calculate final chunk and check balance
