@@ -254,9 +254,9 @@ class EnhancedAudioSplitter:
             logger.warning(f"[{context}] Adjusting chunks from {num_chunks} to {actual_optimal_chunks}")
             num_chunks = actual_optimal_chunks
 
-        # Try VAD-guided splitting
+        # Try VAD-guided splitting with pre-decoded audio
         try:
-            chunks = self._split_with_vad_guidance(input_file, num_chunks, overlap_seconds, context)
+            chunks = self._split_with_vad_guidance(audio, num_chunks, total_duration, overlap_seconds, context)
             if chunks:
                 logger.info(f"[{context}] VAD-guided splitting successful: {len(chunks)} chunks")
                 self._validate_split_results(chunks, total_duration, context)
@@ -267,25 +267,17 @@ class EnhancedAudioSplitter:
             logger.error(f"[{context}] VAD-guided splitting failed: {e}")
             logger.exception(e)
 
-        # Fallback to enhanced even splitting
+        # Fallback to enhanced even splitting with pre-decoded audio
         logger.info(f"[{context}] Falling back to enhanced even splitting")
-        return self._split_even_enhanced(input_file, num_chunks, overlap_seconds, context)
+        return self._split_even_enhanced_with_audio(audio, total_duration, num_chunks, overlap_seconds, context)
 
-    def _split_with_vad_guidance(self, input_file: Union[str, BinaryIO, bytes],
-                                  num_chunks: int, overlap_seconds: float,
-                                  context: str) -> List[Tuple[bytes, float, float]]:
+    def _split_with_vad_guidance(self, audio: np.ndarray, num_chunks: int, total_duration: float,
+                                  overlap_seconds: float, context: str) -> List[Tuple[bytes, float, float]]:
         """
         Enhanced VAD-guided splitting with better error handling
+        Accepts pre-decoded audio data to avoid re-decoding
         """
         try:
-            # Decode audio first
-            success, audio, decode_info = self.decode_audio_safely(input_file, context)
-            if not success:
-                raise RuntimeError(f"Audio decoding failed: {decode_info['error']}")
-
-            # Get total samples for calculation
-            total_samples = len(audio)
-
             # Get speech timestamps using VAD
             speech_timestamps = get_speech_timestamps(
                 audio=audio,
@@ -298,9 +290,6 @@ class EnhancedAudioSplitter:
                 return None
 
             logger.info(f"[{context}] VAD detected {len(speech_timestamps)} speech segments")
-
-            # Calculate total duration from VAD results
-            total_duration = speech_timestamps[-1]['end'] / self.sampling_rate
 
             # Use existing VAD split point logic
             split_points = self._find_vad_split_points_enhanced(
@@ -337,7 +326,7 @@ class EnhancedAudioSplitter:
             # Add last chunk from last split point to end
             last_split = split_points[-1]
             start_sample = last_split['sample']
-            end_sample = total_samples
+            end_sample = len(audio)
 
             chunk_data = self._encode_audio_chunk(
                 audio[start_sample:end_sample], len(split_points), context
@@ -504,7 +493,7 @@ class EnhancedAudioSplitter:
         chunks = []
         for i in range(num_chunks):
             start_idx = i * chunk_size
-            end_idx = (i + 1) * chunk_size if i < num_chunks - 1 else total_samples
+            end_idx = (i + 1) * chunk_size if i < num_chunks - 1 else len(audio)
 
             chunk_samples = audio[start_idx:end_idx]
             start_time = start_idx / self.sampling_rate
@@ -614,6 +603,38 @@ class EnhancedAudioSplitter:
             logger.warning(f"[{context}] High chunk size variance: avg {avg_size:.0f}, variance {size_variance:.0f}")
 
         logger.info(f"[{context}] Split validation completed successfully")
+
+    def _split_even_enhanced_with_audio(self, audio: np.ndarray, total_duration: float,
+                                       num_chunks: int, overlap_seconds: float,
+                                       context: str) -> List[Tuple[bytes, float, float]]:
+        """
+        Enhanced even splitting with pre-decoded audio data
+        """
+        total_samples = len(audio)
+        chunk_size = total_samples // num_chunks
+        overlap_samples = int(overlap_seconds * self.sampling_rate)
+
+        logger.info(f"[{context}] Enhanced even splitting: {total_samples} samples → {num_chunks} chunks ({chunk_size} samples each)")
+
+        chunks = []
+        for i in range(num_chunks):
+            start_sample = i * chunk_size
+            end_sample = start_sample + chunk_size + overlap_samples
+
+            # Ensure we don't exceed audio length
+            if end_sample > total_samples:
+                end_sample = total_samples
+
+            chunk_audio = audio[start_sample:end_sample]
+            chunk_data = self._encode_audio_chunk(chunk_audio, i, context)
+
+            start_time = start_sample / self.sampling_rate
+            end_time = min(end_sample, total_samples) / self.sampling_rate
+
+            chunks.append((chunk_data, start_time, end_time))
+            logger.info(f"[{context}] Chunk {i+1}: {chunk_size} samples ({start_time:.2f}s - {end_time:.2f}s)")
+
+        return chunks
 
 # Convenience function to create enhanced splitter
 def create_enhanced_audio_splitter(sampling_rate: int = 16000) -> EnhancedAudioSplitter:
