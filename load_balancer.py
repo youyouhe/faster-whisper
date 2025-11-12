@@ -1444,6 +1444,294 @@ async def health_handler(request):
     }
     return web.json_response(status)
 
+async def tasks_monitor_handler(request):
+    """任务监控API接口 - 同时读取TUS上传和业务任务数据库"""
+    try:
+        import sqlite3
+        from pathlib import Path
+        from datetime import datetime, timezone
+
+        # 两个数据库路径
+        tus_db_path = os.getenv("DATABASE_PATH", "/data/tus_uploads.db")  # TUS上传管理
+        tasks_db_path = "/data/tasks.db"  # 业务任务管理
+
+        logger.info(f"Tasks monitor: TUS DB={tus_db_path}, Tasks DB={tasks_db_path}")
+
+        # 初始化统计数据
+        tus_stats = {"total_uploads": 0, "uploads_by_status": {}, "recent_uploads": []}
+        task_stats = {"total_tasks": 0, "tasks_by_status": {}, "recent_tasks": []}
+
+        # 读取TUS上传数据库
+        if Path(tus_db_path).exists():
+            try:
+                with sqlite3.connect(tus_db_path) as conn:
+                    cursor = conn.cursor()
+
+                    # TUS上传统计
+                    cursor.execute("SELECT COUNT(*) FROM tus_uploads")
+                    tus_stats["total_uploads"] = cursor.fetchone()[0]
+
+                    # TUS上传状态统计
+                    cursor.execute("SELECT status, COUNT(*) FROM tus_uploads GROUP BY status")
+                    tus_stats["uploads_by_status"] = dict(cursor.fetchall())
+
+                    # 最近TUS上传记录
+                    cursor.execute("""
+                        SELECT id, status, length, created_at, updated_at, metadata, task_id
+                        FROM tus_uploads
+                        ORDER BY created_at DESC
+                        LIMIT 10
+                    """)
+                    columns = [desc[0] for desc in cursor.description]
+                    for row in cursor.fetchall():
+                        upload_dict = dict(zip(columns, row))
+                        # 解析metadata获取文件名
+                        try:
+                            if upload_dict.get('metadata'):
+                                metadata = json.loads(upload_dict['metadata'])
+                                upload_dict['filename'] = metadata.get('filename', 'unknown')
+                            else:
+                                upload_dict['filename'] = 'unknown'
+                        except:
+                            upload_dict['filename'] = 'unknown'
+                        tus_stats["recent_uploads"].append(upload_dict)
+
+                    logger.info(f"TUS uploads: {tus_stats['total_uploads']} total")
+
+            except Exception as e:
+                logger.error(f"Error reading TUS database: {e}")
+        else:
+            logger.warning(f"TUS database not found: {tus_db_path}")
+
+        # 读取业务任务数据库
+        if Path(tasks_db_path).exists():
+            try:
+                with sqlite3.connect(tasks_db_path) as conn:
+                    cursor = conn.cursor()
+
+                    # 业务任务统计
+                    cursor.execute("SELECT COUNT(*) FROM tasks")
+                    task_stats["total_tasks"] = cursor.fetchone()[0]
+
+                    # 业务任务状态统计
+                    cursor.execute("SELECT status, COUNT(*) FROM tasks GROUP BY status")
+                    task_stats["tasks_by_status"] = dict(cursor.fetchall())
+
+                    # 最近业务任务记录
+                    cursor.execute("""
+                        SELECT task_id, status, filename, filesize, created_at, updated_at,
+                               processing_time, error_message
+                        FROM tasks
+                        ORDER BY created_at DESC
+                        LIMIT 20
+                    """)
+                    columns = [desc[0] for desc in cursor.description]
+                    for row in cursor.fetchall():
+                        task_dict = dict(zip(columns, row))
+                        task_stats["recent_tasks"].append(task_dict)
+
+                    # 今日任务统计
+                    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                    cursor.execute("SELECT COUNT(*) FROM tasks WHERE DATE(created_at) = ?", (today,))
+                    task_stats["today_tasks"] = cursor.fetchone()[0]
+
+                    # 处理时间统计
+                    cursor.execute("""
+                        SELECT AVG(processing_time), MIN(processing_time), MAX(processing_time)
+                        FROM tasks
+                        WHERE status = 'completed' AND processing_time IS NOT NULL
+                    """)
+                    timing_stats = cursor.fetchone()
+
+                    task_stats.update({
+                        "avg_processing_time": round(timing_stats[0], 2) if timing_stats[0] else 0,
+                        "min_processing_time": round(timing_stats[1], 2) if timing_stats[1] else 0,
+                        "max_processing_time": round(timing_stats[2], 2) if timing_stats[2] else 0
+                    })
+
+                    logger.info(f"Business tasks: {task_stats['total_tasks']} total")
+
+            except Exception as e:
+                logger.error(f"Error reading tasks database: {e}")
+        else:
+            logger.warning(f"Tasks database not found: {tasks_db_path}")
+
+        # 合并响应数据
+        combined_response = {
+            "tus_uploads": tus_stats,
+            "business_tasks": task_stats,
+            "summary": {
+                "total_operations": tus_stats["total_uploads"] + task_stats["total_tasks"],
+                "tus_uploads_count": tus_stats["total_uploads"],
+                "business_tasks_count": task_stats["total_tasks"],
+                "today_tasks": task_stats.get("today_tasks", 0),
+                "avg_processing_time": task_stats.get("avg_processing_time", 0),
+                "failed_tasks_count": task_stats["tasks_by_status"].get("failed", 0)
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+        logger.info("Combined monitor response prepared successfully")
+        return web.json_response(combined_response)
+
+    except Exception as e:
+        logger.error(f"Unexpected error in tasks monitor handler: {e}")
+        logger.exception(e)
+        return web.json_response({
+            "error": f"Unexpected error: {str(e)}",
+            "tus_uploads": {"total_uploads": 0, "uploads_by_status": {}, "recent_uploads": []},
+            "business_tasks": {"total_tasks": 0, "tasks_by_status": {}, "recent_tasks": []},
+            "summary": {"total_operations": 0}
+        }, status=500)
+
+async def failed_tasks_handler(request):
+    """失败任务详情API接口"""
+    try:
+        import sqlite3
+        from pathlib import Path
+        from datetime import datetime, timezone, timedelta
+
+        # 获取查询参数
+        limit = int(request.query.get('limit', 50))  # 默认返回最近50个失败任务
+        hours = int(request.query.get('hours', 24))   # 默认查询最近24小时
+
+        db_path = "/data/tasks.db"  # 业务任务管理数据库
+
+        if not Path(db_path).exists():
+            return web.json_response({
+                "error": "Database not found",
+                "failed_tasks": [],
+                "error_stats": {}
+            })
+
+        # 计算时间范围
+        cutoff_time = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
+
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+
+            # 查询失败任务
+            cursor.execute("""
+                SELECT task_id, filename, filesize, created_at, updated_at,
+                       error_message, processing_time, language, model, callback_url
+                FROM tasks
+                WHERE status = 'failed' AND created_at >= ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (cutoff_time, limit))
+
+            failed_tasks = []
+            for row in cursor.fetchall():
+                task_dict = {
+                    "task_id": row[0],
+                    "filename": row[1],
+                    "filesize_mb": round(row[2] / (1024*1024), 2) if row[2] else 0,
+                    "created_at": row[3],
+                    "updated_at": row[4],
+                    "error_message": row[5],
+                    "processing_time": row[6],
+                    "language": row[7],
+                    "model": row[8],
+                    "callback_url": row[9]
+                }
+                failed_tasks.append(task_dict)
+
+            # 分析错误类型
+            cursor.execute("""
+                SELECT error_message, COUNT(*) as count
+                FROM tasks
+                WHERE status = 'failed' AND created_at >= ?
+                GROUP BY error_message
+                ORDER BY count DESC
+            """, (cutoff_time,))
+
+            error_stats = {}
+            for error_msg, count in cursor.fetchall():
+                # 简化错误消息用于分类
+                if 'Invalid response from load balancer' in error_msg:
+                    error_type = 'Invalid response from load balancer'
+                elif 'timeout' in error_msg.lower():
+                    error_type = 'Timeout'
+                elif '500' in error_msg:
+                    error_type = 'Server Error (500)'
+                elif '404' in error_msg:
+                    error_type = 'Not Found (404)'
+                elif '401' in error_msg:
+                    error_type = 'Unauthorized (401)'
+                else:
+                    error_type = error_msg[:100] + '...' if len(error_msg) > 100 else error_msg
+
+                if error_type not in error_stats:
+                    error_stats[error_type] = {
+                        "count": 0,
+                        "examples": []
+                    }
+
+                error_stats[error_type]["count"] += count
+
+                # 添加示例（最多3个）
+                if len(error_stats[error_type]["examples"]) < 3:
+                    example_task = next((t for t in failed_tasks if t["error_message"] == error_msg), None)
+                    if example_task:
+                        error_stats[error_type]["examples"].append({
+                            "task_id": example_task["task_id"][:8] + "...",
+                            "filename": example_task["filename"],
+                            "created_at": example_task["created_at"]
+                        })
+
+            # 获取总体统计
+            cursor.execute("""
+                SELECT COUNT(*) FROM tasks
+                WHERE status = 'failed' AND created_at >= ?
+            """, (cutoff_time,))
+            total_failed = cursor.fetchone()[0]
+
+            cursor.execute("""
+                SELECT COUNT(*) FROM tasks
+                WHERE created_at >= ?
+            """, (cutoff_time,))
+            total_tasks = cursor.fetchone()[0]
+
+            response_data = {
+                "failed_tasks": failed_tasks,
+                "error_stats": error_stats,
+                "summary": {
+                    "total_failed": total_failed,
+                    "total_tasks": total_tasks,
+                    "failure_rate": round((total_failed / total_tasks * 100), 2) if total_tasks > 0 else 0,
+                    "time_range_hours": hours,
+                    "query_time": datetime.now(timezone.utc).isoformat()
+                }
+            }
+
+            return web.json_response(response_data)
+
+    except Exception as e:
+        logger.error(f"Error in failed tasks handler: {e}")
+        logger.exception(e)
+        return web.json_response({
+            "error": str(e),
+            "failed_tasks": [],
+            "error_stats": {}
+        }, status=500)
+
+async def static_handler(request):
+    """监控页面静态文件处理"""
+    try:
+        from pathlib import Path
+
+        html_path = Path(__file__).parent / "monitor.html"
+        if html_path.exists():
+            with open(html_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+            return web.Response(text=html_content, content_type='text/html')
+        else:
+            return web.Response(text="Monitor page not found", status=404)
+
+    except Exception as e:
+        logger.error(f"Error serving monitor page: {e}")
+        return web.Response(text="Internal server error", status=500)
+
 async def start_background_tasks(app):
     """Start background tasks after app startup"""
     global queue_processor_task
@@ -1480,6 +1768,9 @@ def init_app():
     app.router.add_post('/inference', inference_handler)
     app.router.add_get('/health', health_handler)
     app.router.add_get('/stats', stats_handler)  # 新增详细统计接口
+    app.router.add_get('/api/tasks/monitor', tasks_monitor_handler)  # 任务监控接口
+    app.router.add_get('/api/tasks/failed', failed_tasks_handler)  # 失败任务详情接口
+    app.router.add_get('/monitor', static_handler)  # 监控页面
 
     # Start background tasks after app is fully initialized
     app.on_startup.append(start_background_tasks)

@@ -11,6 +11,7 @@ import logging
 import os
 from typing import List, Tuple, Optional, Dict, Any
 from audio_splitter import AudioSplitter
+from audio_splitter_enhanced import EnhancedAudioSplitter
 from srt_merger import SRTMerger
 import re
 
@@ -70,10 +71,12 @@ class DistributedProcessor:
 
     def __init__(self):
         self.audio_splitter = AudioSplitter()
+        self.enhanced_splitter = EnhancedAudioSplitter()
         self.srt_merger = SRTMerger()
         self.distributed_threshold_mb = int(os.getenv("DISTRIBUTED_THRESHOLD_MB", "10"))  # MB, configurable
-        self.overlap_seconds = float(os.getenv("OVERLAP_SECONDS", "2.0"))  # seconds, configurable
+        self.overlap_seconds = float(os.getenv("OVERLAP_SECONDS", "0.0"))  # seconds, configurable
         self.min_chunk_size_mb = float(os.getenv("MIN_CHUNK_SIZE_MB", "1.0"))  # MB, minimum chunk size
+        self.use_enhanced_splitter = os.getenv("USE_ENHANCED_SPLITTER", "true").lower() == "true"  # Enable enhanced splitter
 
         # Add concurrency control
         self.max_concurrent_distributed = int(os.getenv("MAX_CONCURRENT_DISTRIBUTED", "3"))  # Allow up to 3 concurrent distributed tasks
@@ -186,9 +189,39 @@ class DistributedProcessor:
                 audio_data = await parse_multipart_data(request_body, boundary)
                 logger.info(f"Extracted audio file: {len(audio_data)} bytes")
 
+                # Validate extracted audio data
+                from audio_splitter_enhanced import EnhancedAudioSplitter
+                temp_splitter = EnhancedAudioSplitter()
+                is_valid, validation_info = temp_splitter.validate_audio_data(audio_data, "multipart extraction")
+
+                if not is_valid:
+                    logger.error(f"Audio data validation failed: {validation_info['issues']}")
+                    raise RuntimeError(f"Audio data validation failed: {', '.join(validation_info['issues'])}")
+
+                logger.info(f"Audio data validation passed: {validation_info['data_size_bytes']} bytes")
+
             except Exception as e:
                 logger.error(f"Failed to extract audio from multipart data: {e}")
                 raise RuntimeError(f"Audio extraction failed: {e}")
+
+            # Preprocess audio to 16kHz mono format for optimal Whisper performance
+            try:
+                audio_data = self._preprocess_audio(audio_data)
+                logger.info(f"Audio preprocessed to 16kHz mono: {len(audio_data)} bytes")
+
+                # Validate preprocessed audio
+                is_valid, validation_info = temp_splitter.validate_audio_data(audio_data, "preprocessing")
+                if not is_valid:
+                    logger.error(f"Preprocessed audio validation failed: {validation_info['issues']}")
+                    logger.warning(f"Continuing with original audio data: {len(audio_data)} bytes")
+                    # Revert to original audio if preprocessing failed
+                else:
+                    logger.info(f"Preprocessed audio validation passed: {validation_info['data_size_bytes']} bytes")
+
+            except Exception as e:
+                logger.error(f"Audio preprocessing failed: {e}")
+                logger.warning(f"Continuing with original audio data: {len(audio_data)} bytes")
+                # Continue with original audio if preprocessing fails
 
             # Calculate optimal chunk count based on file size and constraints
             file_size_mb = len(audio_data) / (1024 * 1024)
@@ -217,21 +250,31 @@ class DistributedProcessor:
                 self.current_distributed_count += 1
                 logger.info(f"Starting distributed processing. Active distributed jobs: {self.current_distributed_count}")
 
-            # Split audio file
+            # Split audio file using enhanced splitter
             try:
                 audio_file = io.BytesIO(audio_data)
-                chunk_data_list = self.audio_splitter.split_with_overlap(
-                    audio_file, num_workers, self.overlap_seconds
-                )
+
+                # Use enhanced splitter if enabled
+                if self.use_enhanced_splitter:
+                    logger.info("Using enhanced audio splitter with VAD-guided boundaries")
+                    chunk_data_list = self.enhanced_splitter.split_with_vad_guidance_enhanced(
+                        audio_file, num_workers, self.overlap_seconds, "distributed processing"
+                    )
+                else:
+                    logger.info("Using standard audio splitter")
+                    chunk_data_list = self.audio_splitter.split_with_overlap(
+                        audio_file, num_workers, self.overlap_seconds
+                    )
 
                 # Extract chunk data and timing information
                 chunk_data = [chunk[0] for chunk in chunk_data_list]
                 chunk_timings = [(chunk[1], chunk[2]) for chunk in chunk_data_list]
 
-                logger.info(f"Split audio into {len(chunk_data)} chunks")
+                logger.info(f"Enhanced audio splitting successful: {len(chunk_data)} chunks")
 
             except Exception as e:
                 logger.error(f"Failed to split audio: {e}")
+                logger.exception(e)
                 raise RuntimeError(f"Audio splitting failed: {e}")
 
             # Process chunks in parallel
@@ -435,3 +478,69 @@ class DistributedProcessor:
             "current_distributed_count": self.current_distributed_count,
             "busy_backends": list(self.busy_backends)
         }
+
+    def _preprocess_audio(self, audio_data: bytes) -> bytes:
+        """
+        Preprocess audio data to 16kHz mono format for optimal Whisper performance
+
+        Args:
+            audio_data: Raw audio data bytes
+
+        Returns:
+            Preprocessed audio data bytes
+        """
+        import subprocess
+        import tempfile
+        import os
+
+        logger.info("Starting audio preprocessing to 16kHz mono format")
+
+        try:
+            # Create temporary files
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_input, \
+                 tempfile.NamedTemporaryFile(suffix='_16k.wav', delete=False) as temp_output:
+
+                # Write original audio data to temporary input file
+                with open(temp_input.name, 'wb') as f:
+                    f.write(audio_data)
+
+                # Use FFmpeg to convert to 16kHz mono
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-i', temp_input.name,
+                    '-ar', '16000',
+                    '-ac', '1',
+                    temp_output.name
+                ]
+
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+
+                logger.info(f"FFmpeg preprocessing output: {result.stdout[:200]}...")
+                logger.debug(f"FFmpeg stderr: {result.stderr[:200]}...")
+
+                # Read the converted audio data
+                with open(temp_output.name, 'rb') as f:
+                    preprocessed_data = f.read()
+
+                # Clean up temporary files
+                os.unlink(temp_input.name)
+                os.unlink(temp_output.name)
+
+                logger.info(f"Audio preprocessing successful: {len(preprocessed_data)} bytes "
+                           f"(original: {len(audio_data)} bytes, "
+                           f"size change: {((len(preprocessed_data) - len(audio_data)) / len(audio_data) * 100):+1f}%)")
+
+                return preprocessed_data
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg preprocessing failed: {e}")
+            logger.error(f"FFmpeg stderr: {e.stderr}")
+            raise RuntimeError(f"Audio preprocessing failed: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error during audio preprocessing: {e}")
+            raise RuntimeError(f"Audio preprocessing error: {e}")
