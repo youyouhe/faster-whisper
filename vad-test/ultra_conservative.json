@@ -1,0 +1,18 @@
+{
+  "audio_file": "66.wav",
+  "parameters": {
+    "frame_length": 4096,
+    "hop_length": 512,
+    "energy_threshold": 0.05,
+    "silence_duration": 3.0
+  },
+  "silence_segments": [
+    {
+      "start": 1121.216,
+      "end": 1124.32,
+      "duration": 3.104000000000042
+    }
+  ],
+  "total_silence_time": 3.104000000000042,
+  "silence_ratio": 0.0025324540792555873
+}

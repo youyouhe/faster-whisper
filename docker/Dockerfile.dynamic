@@ -28,7 +28,8 @@ RUN chmod +x /app/start_dynamic_services.sh /app/start_multi_instance_per_gpu.sh
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --no-deps -e . && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir torch>=1.10.0 torchaudio>=0.10.0 --index-url https://download.pytorch.org/whl/cu121
 
 # Note: Model download is handled at runtime to avoid build-time network issues
 # Models will be downloaded when the service first starts

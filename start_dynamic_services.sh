@@ -1,18 +1,15 @@
 #!/bin/bash
-# Script to start multiple faster-whisper instances per GPU with load balancing
-# 每个GPU启动1个实例的简化版本
+# Script to dynamically detect GPUs and start faster-whisper services with load balancing
 
 # Exit on any error
 set -e
 export LD_LIBRARY_PATH=$(python3 -c "import nvidia.cublas.lib; import nvidia.cudnn.lib; print(nvidia.cublas.lib.__path__[0] + ':' + nvidia.cudnn.lib.__path__[0])")
 
-# 配置参数
-INSTANCES_PER_GPU=${INSTANCES_PER_GPU:-1}  # 每GPU实例数，默认1个
-
-# Function to detect available GPUs (复用原有逻辑)
+# Function to detect available GPUs
 detect_gpus() {
     echo "🔍 Detecting available GPUs..."
 
+    
     # Use Python script for robust GPU detection
     if [[ -f "/app/docker/detect_gpus.py" ]]; then
         GPU_COUNT=$(python3 /app/docker/detect_gpus.py 2>/dev/null)
@@ -80,11 +77,11 @@ cleanup() {
         kill $LB_PID 2>/dev/null || true
     fi
 
-    # Kill all GPU service instances
-    echo "Stopping backend service instances..."
+    # Kill GPU services
+    echo "Stopping backend services..."
     for i in "${!GPU_PIDS[@]}"; do
         if [[ -n "${GPU_PIDS[$i]}" ]]; then
-            echo "Stopping instance ${GPU_INSTANCE_IDS[$i]} (PID: ${GPU_PIDS[$i]})..."
+            echo "Stopping GPU $i service (PID: ${GPU_PIDS[$i]})..."
             kill ${GPU_PIDS[$i]} 2>/dev/null || true
         fi
     done
@@ -122,51 +119,33 @@ if ! [[ "$NUM_GPUS" =~ ^[0-9]+$ ]] || [[ "$NUM_GPUS" -lt 1 ]]; then
     NUM_GPUS=1
 fi
 
-# Arrays to store PIDs and information
+# Arrays to store PIDs
 declare -a GPU_PIDS
-declare -a GPU_INSTANCE_IDS
 BACKEND_URLS=()
 
-# Start GPU service instances
-echo "🚀 Starting $NUM_GPUS GPU(s) with $INSTANCES_PER_GPU instances per GPU..."
+# Start GPU services on different ports
+echo "🚀 Starting $NUM_GPUS GPU service instance(s)..."
 START_PORT=5002
 
-for ((gpu_id=0; gpu_id<NUM_GPUS; gpu_id++)); do
-    for ((instance=0; instance<INSTANCES_PER_GPU; instance++)); do
-        # Calculate port for this instance
-        port=$((START_PORT + gpu_id * INSTANCES_PER_GPU + instance))
-        instance_id="${gpu_id}_${instance}"
+for ((i=0; i<NUM_GPUS; i++)); do
+    # Set environment variables for this GPU service
+    export CUDA_VISIBLE_DEVICES=$i
+    export API_PORT=$((START_PORT + i))
+    export GPU_DEVICE_ID=$i
 
-        # Set environment variables for this GPU service instance
-        export CUDA_VISIBLE_DEVICES=$gpu_id
-        export API_PORT=$port
-        export GPU_DEVICE_ID=$gpu_id
-        export INSTANCE_ID=$instance_id
-
-        echo "Starting GPU $gpu_id instance $instance on port $port (Instance ID: $instance_id)..."
-
-        # Start the service instance
-        python3 faster_whisper_api.py &
-
-        # Store PID and information
-        pid=$!
-        GPU_PIDS+=($pid)
-        GPU_INSTANCE_IDS+=($instance_id)
-        BACKEND_URLS+=("http://localhost:$port")
-
-        echo "✅ Started GPU $gpu_id instance $instance on port $port (PID: $pid, Instance ID: $instance_id)"
-
-        # Small delay between starting instances to avoid conflicts
-        sleep 1
-    done
+    echo "Starting GPU $i service on port $API_PORT..."
+    python3 faster_whisper_api.py &
+    GPU_PIDS[$i]=$!
+    BACKEND_URLS+=("http://localhost:$API_PORT")
+    echo "✅ Started GPU $i service on port $API_PORT (PID: ${GPU_PIDS[$i]})"
 done
 
-# Wait a moment for all services to initialize
-if [[ ${#GPU_PIDS[@]} -gt 0 ]]; then
-    echo "⏳ Waiting for ${#GPU_PIDS[@]} service instances to initialize..."
+# Wait a moment for services to initialize
+if [[ $NUM_GPUS -gt 0 ]]; then
+    echo "⏳ Waiting for GPU services to initialize..."
     sleep 30
 else
-    echo "ℹ️  No GPU service instances to initialize."
+    echo "ℹ️  No GPU services to initialize."
 fi
 
 # Start load balancer on port 5001
@@ -184,33 +163,25 @@ echo "✅ Started load balancer on port 5001 (PID: $LB_PID)"
 echo ""
 echo "✅ All services started successfully!"
 echo "🌐 Load balancer running on http://localhost:5001"
-echo "🔧 Backend service instances running:"
-for ((i=0; i<${#GPU_PIDS[@]}; i++)); do
-    echo "   - Instance ${GPU_INSTANCE_IDS[$i]}: Port ${BACKEND_URLS[$i]##*:} (PID: ${GPU_PIDS[$i]})"
-done
-echo ""
+if [[ $NUM_GPUS -gt 0 ]]; then
+    echo "🔧 Backend services running on ports $START_PORT-$((START_PORT + NUM_GPUS - 1))"
+else
+    echo "🔧 No GPU backend services running (CPU mode)"
+fi
 echo "⚙️  Configuration:"
-echo "   - GPUs detected: $NUM_GPUS"
-echo "   - Instances per GPU: $INSTANCES_PER_GPU"
-echo "   - Total instances: ${#GPU_PIDS[@]}"
 echo "   - Request timeout: 30 minutes (for large audio files)"
 echo "   - Max queue size: 100 requests"
 echo "   - Health check interval: 30 seconds"
 echo ""
-echo "💡 Service instances started with PIDs:"
+echo "💡 Services started with PIDs:"
 echo "   - Load Balancer: $LB_PID"
-for ((i=0; i<${#GPU_PIDS[@]}; i++)); do
-    echo "   - Instance ${GPU_INSTANCE_IDS[$i]}: ${GPU_PIDS[$i]}"
+for ((i=0; i<NUM_GPUS; i++)); do
+    echo "   - Backend $((START_PORT + i)): ${GPU_PIDS[$i]}"
 done
 echo ""
 echo "📊 Service status:"
 echo "   - Health endpoint: http://localhost:5001/health"
 echo "   - Load balancer ready to accept requests"
-echo ""
-echo "🔍 Monitoring commands:"
-echo "   - Check GPU utilization: nvidia-smi"
-echo "   - Check service health: curl http://localhost:5001/health"
-echo "   - View logs: docker logs <container_name>"
 echo ""
 echo "⚠️  Press Ctrl+C to stop all services"
 

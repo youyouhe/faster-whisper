@@ -1,0 +1,136 @@
+{
+  "timestamp": "2025-11-12T16:16:09.949419",
+  "audio_file": "66.wav",
+  "total_tests": 16,
+  "successful_tests": 16,
+  "results": [
+    {
+      "name": "baseline",
+      "params": "",
+      "segments": 171,
+      "total_silence": 123.74399999999967,
+      "silence_ratio": 10.09587621080536,
+      "description": "基础配置"
+    },
+    {
+      "name": "sensitive_threshold",
+      "params": "-t 0.005",
+      "segments": 133,
+      "total_silence": 98.27199999999948,
+      "silence_ratio": 8.017697399375013,
+      "description": "低阈值-敏感检测"
+    },
+    {
+      "name": "relaxed_threshold",
+      "params": "-t 0.02",
+      "segments": 287,
+      "total_silence": 205.6960000000008,
+      "silence_ratio": 16.78207713552037,
+      "description": "高阈值-宽松检测"
+    },
+    {
+      "name": "very_relaxed",
+      "params": "-t 0.05",
+      "segments": 697,
+      "total_silence": 616.8639999999984,
+      "silence_ratio": 50.32795596475172,
+      "description": "极高阈值-只检测明显静音"
+    },
+    {
+      "name": "short_silence",
+      "params": "-d 0.2",
+      "segments": 572,
+      "total_silence": 262.8479999999998,
+      "silence_ratio": 21.44492557423206,
+      "description": "短静音段-0.2秒"
+    },
+    {
+      "name": "long_silence",
+      "params": "-d 1.0",
+      "segments": 31,
+      "total_silence": 38.751999999999995,
+      "silence_ratio": 3.161651432967499,
+      "description": "长静音段-1.0秒"
+    },
+    {
+      "name": "very_long",
+      "params": "-d 2.0",
+      "segments": 1,
+      "total_silence": 2.304,
+      "silence_ratio": 0.18797597289319568,
+      "description": "很长静音段-2.0秒"
+    },
+    {
+      "name": "small_window",
+      "params": "-f 1024",
+      "segments": 180,
+      "total_silence": 130.14400000000032,
+      "silence_ratio": 10.618031691064289,
+      "description": "小窗口-高时间精度"
+    },
+    {
+      "name": "large_window",
+      "params": "-f 4096",
+      "segments": 146,
+      "total_silence": 108.3519999999993,
+      "silence_ratio": 8.840092280782729,
+      "description": "大窗口-高稳定性"
+    },
+    {
+      "name": "small_hop",
+      "params": "-l 256",
+      "segments": 165,
+      "total_silence": 120.62400000000001,
+      "silence_ratio": 9.841325414179183,
+      "description": "小帧移-高精度"
+    },
+    {
+      "name": "large_hop",
+      "params": "-l 1024",
+      "segments": 193,
+      "total_silence": 135.99999999999972,
+      "silence_ratio": 11.095803955501111,
+      "description": "大帧移-快速处理"
+    },
+    {
+      "name": "fine_detection",
+      "params": "-t 0.005 -d 0.3",
+      "segments": 384,
+      "total_silence": 197.95199999999994,
+      "silence_ratio": 16.150269004407058,
+      "description": "精细检测"
+    },
+    {
+      "name": "stable_detection",
+      "params": "-t 0.02 -d 1.0 -f 4096",
+      "segments": 38,
+      "total_silence": 48.895999999999816,
+      "silence_ratio": 3.9892678691778047,
+      "description": "稳定检测"
+    },
+    {
+      "name": "precise_detection",
+      "params": "-t 0.01 -f 1024 -l 256",
+      "segments": 176,
+      "total_silence": 127.6640000000007,
+      "silence_ratio": 10.415696442464006,
+      "description": "精确检测"
+    },
+    {
+      "name": "ultra_sensitive",
+      "params": "-t 0.003 -d 0.1 -f 1024 -l 128",
+      "segments": 974,
+      "total_silence": 285.6639999999991,
+      "silence_ratio": 23.306409861354897,
+      "description": "超敏感"
+    },
+    {
+      "name": "ultra_conservative",
+      "params": "-t 0.05 -d 3.0 -f 4096",
+      "segments": 1,
+      "total_silence": 3.104000000000042,
+      "silence_ratio": 0.2532454079255587,
+      "description": "超保守"
+    }
+  ]
+}

@@ -254,22 +254,60 @@ class EnhancedAudioSplitter:
             logger.warning(f"[{context}] Adjusting chunks from {num_chunks} to {actual_optimal_chunks}")
             num_chunks = actual_optimal_chunks
 
-        # Try VAD-guided splitting with pre-decoded audio
+        # Progressive VAD-guided splitting with adaptive thresholds
         try:
-            chunks = self._split_with_vad_guidance(audio, num_chunks, total_duration, overlap_seconds, context)
+            chunks = self._progressive_vad_splitting(audio, num_chunks, total_duration, overlap_seconds, context)
             if chunks:
-                logger.info(f"[{context}] VAD-guided splitting successful: {len(chunks)} chunks")
+                logger.info(f"[{context}] Progressive VAD-guided splitting successful: {len(chunks)} chunks")
                 self._validate_split_results(chunks, total_duration, context)
                 return chunks
             else:
-                logger.warning(f"[{context}] VAD-guided splitting returned no chunks")
+                logger.warning(f"[{context}] Progressive VAD-guided splitting returned no chunks")
         except Exception as e:
-            logger.error(f"[{context}] VAD-guided splitting failed: {e}")
+            logger.error(f"[{context}] Progressive VAD-guided splitting failed: {e}")
             logger.exception(e)
 
         # Fallback to enhanced even splitting with pre-decoded audio
         logger.info(f"[{context}] Falling back to enhanced even splitting")
         return self._split_even_enhanced_with_audio(audio, total_duration, num_chunks, overlap_seconds, context)
+
+    def _progressive_vad_splitting(self, audio: np.ndarray, num_chunks: int, total_duration: float,
+                                overlap_seconds: float, context: str) -> List[Tuple[bytes, float, float]]:
+        """
+        Enhanced progressive VAD splitting using hybrid VAD detector
+        """
+        try:
+            # Import and use the hybrid VAD detector
+            from hybrid_vad_detector import HybridVADDetector
+
+            # Create hybrid VAD detector with energy-primary strategy
+            detector = HybridVADDetector(
+                sample_rate=self.sampling_rate,
+                energy_threshold=0.01,  # Based on your test results
+                min_silence_duration_energy=0.5,  # Start with 0.5s threshold
+                hybrid_mode="energy_primary",  # Use energy as primary, validated by silero
+                confidence_threshold=0.6
+            )
+
+            logger.info(f"[{context}] Using hybrid VAD detector for {num_chunks} chunks")
+
+            # Get optimal split points
+            split_points = detector.get_optimal_split_points(audio, num_chunks)
+
+            if len(split_points) >= num_chunks - 1:
+                logger.info(f"[{context}] Hybrid VAD found {len(split_points)} optimal split points")
+                return self._create_chunks_from_split_points(audio, split_points, total_duration,
+                                                          num_chunks, overlap_seconds, context)
+            else:
+                logger.warning(f"[{context}] Hybrid VAD found only {len(split_points)} split points, need {num_chunks - 1}")
+
+        except ImportError:
+            logger.warning(f"[{context}] Hybrid VAD detector not available, falling back to original silero VAD")
+        except Exception as e:
+            logger.error(f"[{context}] Hybrid VAD detector failed: {e}")
+
+        # Fallback to original progressive silero VAD
+        return self._progressive_silero_vad_splitting(audio, num_chunks, total_duration, overlap_seconds, context)
 
     def _split_with_vad_guidance(self, audio: np.ndarray, num_chunks: int, total_duration: float,
                                   overlap_seconds: float, context: str) -> List[Tuple[bytes, float, float]]:
@@ -278,10 +316,16 @@ class EnhancedAudioSplitter:
         Accepts pre-decoded audio data to avoid re-decoding
         """
         try:
-            # Get speech timestamps using VAD
+            # Create VAD options with current threshold
+            current_vad_options = VadOptions(
+                min_silence_duration_ms=int(min_silence_duration * 1000),
+                max_speech_duration_s=60  # Allow longer speech segments
+            )
+
+            # Get speech timestamps using VAD with current threshold
             speech_timestamps = get_speech_timestamps(
                 audio=audio,
-                vad_options=self.vad_options,
+                vad_options=current_vad_options,
                 sampling_rate=self.sampling_rate
             )
 
@@ -536,6 +580,250 @@ class EnhancedAudioSplitter:
                 logger.warning(f"[{context}] Using synthetic split at {target_pos:.2f}s")
 
         return split_points
+
+    def _create_chunks_from_silences(self, audio: np.ndarray, silences: List[dict], num_chunks: int,
+                                      overlap_seconds: float, context: str) -> List[Tuple[bytes, float, float]]:
+        """
+        Create chunks from silence points
+        """
+        # Sort silences by position
+        silences.sort(key=lambda x: x['start_time'])
+
+        # Take only needed silences
+        needed_silences = silences[:num_chunks - 1]
+
+        chunks = []
+        prev_time = 0.0
+
+        for i, silence in enumerate(needed_silences):
+            end_time = silence['start_time']
+            start_sample = int(prev_time * self.sampling_rate)
+            end_sample = int(end_time * self.sampling_rate)
+
+            chunk_audio = audio[start_sample:end_sample]
+            chunk_data = self._encode_audio_chunk(chunk_audio, i, context)
+
+            chunks.append((chunk_data, prev_time, end_time))
+            logger.info(f"[{context}] Chunk {i+1}: {end_time - prev_time:.2f}s (silence at {silence['start_time']:.2f}s)")
+            prev_time = end_time
+
+        # Add final chunk
+        final_chunk_data = self._encode_audio_chunk(audio[int(prev_time * self.sampling_rate):], num_chunks, context)
+        chunks.append((final_chunk_data, prev_time, len(audio) / self.sampling_rate))
+
+        return chunks
+
+    def _progressive_silero_vad_splitting(self, audio: np.ndarray, num_chunks: int, total_duration: float,
+                                         overlap_seconds: float, context: str) -> List[Tuple[bytes, float, float]]:
+        """
+        Original progressive silero VAD splitting as fallback
+        """
+        # Progressive threshold strategy: 1.0s → 0.5s → 0.3s
+        thresholds = [1.0, 0.5, 0.3]
+        needed_silences = num_chunks - 1
+
+        logger.info(f"[{context}] Progressive silero VAD: Need {needed_silences} silences for {num_chunks} chunks")
+
+        for attempt, min_silence_duration in enumerate(thresholds):
+            logger.info(f"[{context}] Attempt {attempt + 1}/{len(thresholds)}: {min_silence_duration}s silence threshold")
+
+            # Create VAD options with current threshold
+            current_vad_options = VadOptions(
+                min_silence_duration_ms=int(min_silence_duration * 1000),
+                max_speech_duration_s=60
+            )
+
+            # Get speech timestamps using VAD with current threshold
+            speech_timestamps = get_speech_timestamps(
+                audio=audio,
+                vad_options=current_vad_options,
+                sampling_rate=self.sampling_rate
+            )
+
+            logger.info(f"[{context}] Silero VAD detected {len(speech_timestamps)} speech segments")
+
+            if not speech_timestamps:
+                logger.warning(f"[{context}] No speech segments detected by silero VAD")
+                continue
+
+            # Find silences between speech segments
+            silences = []
+            for i in range(len(speech_timestamps) - 1):
+                current_end = speech_timestamps[i]["end"]
+                next_start = speech_timestamps[i + 1]["start"]
+                silence_duration = (next_start - current_end) / self.sampling_rate
+
+                if silence_duration >= min_silence_duration:
+                    silences.append({
+                        "sample": (current_end + next_start) // 2,
+                        "duration": silence_duration,
+                        "start_time": current_end / self.sampling_rate,
+                        "end_time": next_start / self.sampling_rate
+                    })
+
+            logger.info(f"[{context}] Found {len(silences)} silences ≥ {min_silence_duration}s")
+
+            if len(silences) >= needed_silences:
+                logger.info(f"[{context}] ✅ Silero VAD success! Using {min_silence_duration}s threshold")
+                return self._create_chunks_from_silences(audio, silences, num_chunks, overlap_seconds, context)
+
+            if attempt < len(thresholds) - 1:
+                deficit = needed_silences - len(silences)
+                logger.warning(f"[{context}] Need {deficit} more silences, trying lower threshold...")
+                continue
+
+        # All thresholds failed
+        logger.error(f"[{context}] All silero VAD thresholds failed, falling back to even splitting")
+        return None
+
+    def _create_chunks_from_split_points(self, audio: np.ndarray, split_points: List[float],
+                                       total_duration: float, num_chunks: int,
+                                       overlap_seconds: float, context: str) -> List[Tuple[bytes, float, float]]:
+        """
+        Create chunks from optimal split points
+        """
+        logger.info(f"[{context}] Creating {num_chunks} chunks from {len(split_points)} split points")
+
+        # Convert split points to boundaries
+        boundaries = [0.0] + split_points + [total_duration]
+
+        # Adjust boundaries to ensure we get exactly num_chunks
+        if len(boundaries) - 1 != num_chunks:
+            boundaries = self._adjust_boundaries_for_chunks(boundaries, num_chunks, total_duration, context)
+
+        chunks = []
+        for i in range(num_chunks):
+            start_time = boundaries[i]
+            end_time = boundaries[i + 1]
+
+            # Apply overlap (except for first and last chunks)
+            if i > 0:
+                start_time = max(0.0, start_time - overlap_seconds)
+            if i < num_chunks - 1:
+                end_time = min(total_duration, end_time + overlap_seconds)
+
+            # Convert time to sample indices
+            start_sample = int(start_time * self.sampling_rate)
+            end_sample = int(end_time * self.sampling_rate)
+
+            # Extract audio chunk
+            chunk_samples = audio[start_sample:end_sample]
+
+            # Encode and add to list
+            chunk_data = self._encode_audio_chunk(chunk_samples, i, context)
+            chunks.append((chunk_data, start_time, end_time))
+
+            logger.info(f"[{context}] Chunk {i+1}/{num_chunks}: {len(chunk_samples)} samples "
+                       f"({start_time:.2f}s - {end_time:.2f}s, duration: {end_time-start_time:.2f}s)")
+
+        return chunks
+
+    def _adjust_boundaries_for_chunks(self, boundaries: List[float], num_chunks: int,
+                                    total_duration: float, context: str) -> List[float]:
+        """
+        Adjust boundaries to create exactly num_chunks chunks
+        """
+        logger.info(f"[{context}] Adjusting boundaries: have {len(boundaries)-1} segments, need {num_chunks}")
+
+        if len(boundaries) - 1 < num_chunks:
+            # Need more chunks - add synthetic splits
+            current_chunks = len(boundaries) - 1
+            needed_splits = num_chunks - current_chunks
+
+            logger.info(f"[{context}] Adding {needed_splits} synthetic splits to reach {num_chunks} chunks")
+
+            # Find longest segments and split them
+            for _ in range(needed_splits):
+                max_duration = 0
+                split_idx = -1
+
+                for i in range(len(boundaries) - 1):
+                    duration = boundaries[i + 1] - boundaries[i]
+                    if duration > max_duration:
+                        max_duration = duration
+                        split_idx = i
+
+                if split_idx >= 0:
+                    # Split the longest segment at midpoint
+                    mid_point = (boundaries[split_idx] + boundaries[split_idx + 1]) / 2
+                    boundaries.insert(split_idx + 1, mid_point)
+
+        elif len(boundaries) - 1 > num_chunks:
+            # Too many chunks - merge smallest segments
+            current_chunks = len(boundaries) - 1
+            needed_merges = current_chunks - num_chunks
+
+            logger.info(f"[{context}] Merging {needed_merges} segments to reach {num_chunks} chunks")
+
+            for _ in range(needed_merges):
+                min_duration = float('inf')
+                merge_idx = -1
+
+                for i in range(len(boundaries) - 2):
+                    duration = boundaries[i + 1] - boundaries[i]
+                    if duration < min_duration:
+                        min_duration = duration
+                        merge_idx = i
+
+                if merge_idx >= 0:
+                    # Remove the boundary to merge segments
+                    boundaries.pop(merge_idx + 1)
+
+        # Ensure boundaries start at 0 and end at total_duration
+        boundaries[0] = 0.0
+        boundaries[-1] = total_duration
+
+        logger.info(f"[{context}] Adjusted boundaries: {len(boundaries)-1} chunks")
+        return boundaries
+
+    def _hybrid_chunks_from_audio(self, audio: np.ndarray, silences: List[dict], num_chunks: int,
+                                  total_duration: float, overlap_seconds: float, context: str) -> List[Tuple[bytes, float, float]]:
+        """
+        Hybrid approach: combine available silences with synthetic splits
+        """
+        logger.info(f"[{context}] Hybrid approach: combining {len(silences)} silences with synthetic splits")
+
+        target_duration = total_duration / num_chunks
+        split_points = []
+
+        for i in range(num_chunks - 1):
+            target_pos = (i + 1) * target_duration
+
+            # Find closest silence to target position
+            best_silence = None
+            min_distance = float('inf')
+
+            for silence in silences:
+                if silence['start_time'] <= target_pos:
+                    distance = target_pos - silence['start_time']
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_silence = silence
+
+            if best_silence and min_distance <= target_duration * 0.4:
+                split_points.append(best_silence['start_time'])
+            else:
+                split_points.append(target_pos)
+
+        # Create chunks from split points
+        chunks = []
+        prev_time = 0.0
+
+        for i, split_time in enumerate(split_points):
+            start_sample = int(prev_time * self.sampling_rate)
+            end_sample = int(split_time * self.sampling_rate)
+
+            chunk_audio = audio[start_sample:end_sample]
+            chunk_data = self._encode_audio_chunk(chunk_audio, i, context)
+
+            chunks.append((chunk_data, prev_time, split_time))
+            prev_time = split_time
+
+        # Add final chunk
+        final_chunk_data = self._encode_audio_chunk(audio[int(prev_time * self.sampling_rate):], num_chunks, context)
+        chunks.append((final_chunk_data, prev_time, total_duration))
+
+        return chunks
 
     def _split_even_enhanced(self, input_file: Union[str, BinaryIO, bytes],
                            num_chunks: int, overlap_seconds: float,

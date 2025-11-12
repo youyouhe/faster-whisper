@@ -120,7 +120,7 @@ services:
       - DATABASE_PATH=/data/tus_uploads.db
       - DATA_DIR=/data
       - API_KEY=${API_KEY:-your-secret-api-key-here}
-      - INSTANCES_PER_GPU=2  # 每GPU启动2个实例
+      - INSTANCES_PER_GPU=1  # 每GPU启动1个实例
       - STARTUP_MODE=multi_instance  # 使用多实例启动模式
     deploy:
       resources:
@@ -134,6 +134,7 @@ services:
       - ./logs:/app/logs
       - ./data:/data
       - ./:/app  # Map entire source code directory to enable live code updates
+      - ~/.cache/huggingface:/root/.cache/huggingface  # Persist Hugging Face models
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
