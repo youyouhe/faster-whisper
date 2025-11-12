@@ -343,45 +343,70 @@ class EnhancedAudioSplitter:
     def _find_vad_split_points_enhanced(self, speech_segments: List[dict], num_chunks: int,
                                       total_duration: float, context: str) -> List[dict]:
         """
-        Enhanced VAD split point finding with better validation
+        Adaptive VAD split point finding with progressive silence thresholds
+        Strategy: 1.0s → 0.5s → 0.3s
         """
-        # Find silences between speech segments
-        silences = []
-        min_silence_duration = 0.5  # Reduced to 0.5s to find more split points in continuous speech
+        # Progressive threshold strategy
+        thresholds = [1.0, 0.5, 0.3]  # From strict to lenient
+        needed_silences = num_chunks - 1
 
-        for i in range(len(speech_segments) - 1):
-            current_end = speech_segments[i]["end"]
-            next_start = speech_segments[i + 1]["start"]
-            silence_duration = (next_start - current_end) / self.sampling_rate
+        logger.info(f"[{context}] Adaptive VAD: Need {needed_silences} silences for {num_chunks} chunks")
+        logger.info(f"[{context}] Starting progressive threshold detection...")
 
-            if silence_duration >= min_silence_duration:
-                silences.append({
-                    "sample": (current_end + next_start) // 2,  # Middle of silence
-                    "duration": silence_duration,
-                    "start_sample": current_end,
-                    "end_sample": next_start,
-                    "start_time": current_end / self.sampling_rate,
-                    "end_time": next_start / self.sampling_rate
-                })
+        for attempt, min_silence_duration in enumerate(thresholds):
+            logger.info(f"[{context}] Attempt {attempt + 1}/{len(thresholds)}: {min_silence_duration}s silence threshold")
 
-        logger.info(f"[{context}] Found {len(silences)} suitable silences (>= {min_silence_duration}s)")
-        for i, silence in enumerate(silences[:5]):  # Log first 5
-            logger.info(f"[{context}] Silence {i+1}: {silence['start_time']:.2f}s-{silence['end_time']:.2f}s, duration: {silence['duration']:.2f}s")
+            # Find silences with current threshold
+            silences = []
+            for i in range(len(speech_segments) - 1):
+                current_end = speech_segments[i]["end"]
+                next_start = speech_segments[i + 1]["start"]
+                silence_duration = (next_start - current_end) / self.sampling_rate
 
-        if len(silences) > 0:
-            logger.info(f"[{context}] Longest silence: {max(s['duration'] for s in silences):.2f}s")
+                if silence_duration >= min_silence_duration:
+                    silences.append({
+                        "sample": (current_end + next_start) // 2,
+                        "duration": silence_duration,
+                        "start_time": current_end / self.sampling_rate,
+                        "end_time": next_start / self.sampling_rate
+                    })
 
-        # Check if we have enough silences
-        if len(silences) < num_chunks - 1:
-            available_silences = len(silences)
-            logger.warning(f"[{context}] Not enough silences for {num_chunks} chunks (need {num_chunks-1}, have {available_silences})")
+            logger.info(f"[{context}] Found {len(silences)} silences ≥ {min_silence_duration}s")
 
-            # If we have some silences, use them even if not optimal
-            if available_silences > 0:
-                logger.info(f"[{context}] Using available {available_silences} silences for partial VAD splitting")
+            # Log silence analysis
+            if silences:
+                longest_silence = max(s['duration'] for s in silences)
+                avg_silence = sum(s['duration'] for s in silences) / len(silences)
+                logger.info(f"[{context}] Silence stats: longest={longest_silence:.2f}s, avg={avg_silence:.2f}s")
+                silence_durations = [f"{s['duration']:.2f}s" for s in silences[:3]]
+                logger.info(f"[{context}] First 3 silences: {silence_durations}")
+
+            # Check if we have enough silences
+            if len(silences) >= needed_silences:
+                logger.info(f"[{context}] ✅ Success! Found {len(silences)} silences with {min_silence_duration}s threshold")
+                logger.info(f"[{context}] Using {min_silence_duration}s threshold for optimal splitting")
+
+                # Use balanced split selection with found silences
+                return self._balanced_split_selection(silences, num_chunks, total_duration, context)
+
+            # If not enough silences and not the last threshold
+            if attempt < len(thresholds) - 1:
+                deficit = needed_silences - len(silences)
+                logger.warning(f"[{context}] ⚠️  Need {deficit} more silences, trying lower threshold...")
+                continue
+
+            # Last threshold - use what we have or fallback
+            logger.error(f"[{context}] ❌ Even with {min_silence_duration}s threshold, only found {len(silences)} silences")
+            if len(silences) > 0:
+                logger.warning(f"[{context}] Using hybrid approach with available silences")
+                return self._hybrid_split_approach(silences, num_chunks, total_duration, context)
             else:
-                logger.warning(f"[{context}] No suitable silences found, falling back to even splitting")
+                logger.error(f"[{context}] No silences found - this is continuous speech")
                 return None
+
+        # This should never be reached
+        logger.error(f"[{context}] Unexpected error in progressive threshold detection")
+        return None
 
         # Sort silences by duration (prefer longer silences)
         silences.sort(key=lambda x: x['duration'], reverse=True)
@@ -470,6 +495,47 @@ class EnhancedAudioSplitter:
             logger.warning(f"[{context}] High variance detected ({variance_percent:.1f}%). Consider reducing silence threshold to 0.5s for better balance")
 
         return split_points[:num_chunks - 1]
+
+    def _hybrid_split_approach(self, silences: List[dict], num_chunks: int,
+                              total_duration: float, context: str) -> List[dict]:
+        """
+        Hybrid approach: combine available silences with synthetic splits
+        """
+        logger.info(f"[{context}] Hybrid approach: combining {len(silences)} silences with synthetic splits")
+
+        # Calculate ideal split positions
+        target_duration = total_duration / num_chunks
+        split_points = []
+
+        for i in range(num_chunks - 1):
+            target_pos = (i + 1) * target_duration
+
+            # Find closest silence to target position
+            best_silence = None
+            min_distance = float('inf')
+
+            for silence in silences:
+                if silence['start_time'] <= target_pos:
+                    distance = target_pos - silence['start_time']
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_silence = silence
+
+            if best_silence and min_distance <= target_duration * 0.4:
+                split_points.append(best_silence)
+                logger.info(f"[{context}] Using silence at {best_silence['start_time']:.2f}s")
+            else:
+                # Create synthetic split
+                synthetic_point = {
+                    'sample': int(target_pos * self.sampling_rate),
+                    'time': target_pos,
+                    'duration': 0.0,
+                    'synthetic': True
+                }
+                split_points.append(synthetic_point)
+                logger.warning(f"[{context}] Using synthetic split at {target_pos:.2f}s")
+
+        return split_points
 
     def _split_even_enhanced(self, input_file: Union[str, BinaryIO, bytes],
                            num_chunks: int, overlap_seconds: float,
