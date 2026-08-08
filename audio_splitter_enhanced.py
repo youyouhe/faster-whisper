@@ -48,28 +48,38 @@ class EnhancedAudioSplitter:
             logger.error(f"[{context}] Audio validation failed: Empty data")
             return False, validation_info
 
-        # Check minimum size for WAV processing
-        min_wav_size = 44  # WAV header size
-        if len(audio_data) < min_wav_size:
-            validation_info["issues"].append(f"Audio data too small ({len(audio_data)} bytes < {min_wav_size} bytes)")
-            logger.error(f"[{context}] Audio validation failed: Data too small for WAV format")
+        # Check minimum size for a recognizable audio header
+        min_header_size = 44  # WAV header size (其他格式的魔数检查只需前12字节)
+        if len(audio_data) < min_header_size:
+            validation_info["issues"].append(f"Audio data too small ({len(audio_data)} bytes < {min_header_size} bytes)")
+            logger.error(f"[{context}] Audio validation failed: Data too small for audio format")
             return False, validation_info
 
-        # Check WAV header
+        # Check audio format by magic bytes (支持 WAV/MP3/FLAC/OGG/M4A/MP4/AIFF/WebM)
         try:
             header = audio_data[:44]
-            if not (header.startswith(b'RIFF') and b'WAVE' in header[:12]):
-                validation_info["issues"].append("Invalid WAV header format")
-                logger.error(f"[{context}] Audio validation failed: Invalid WAV header")
+
+            is_wav = header.startswith(b'RIFF') and b'WAVE' in header[:12]
+            is_mp3 = header.startswith(b'ID3') or (header[0] == 0xFF and (header[1] & 0xE0) == 0xE0)
+            is_flac = header.startswith(b'fLaC')
+            is_ogg = header.startswith(b'OggS')
+            is_mp4 = header[4:8] == b'ftyp'  # M4A/MP4/MOV
+            is_aiff = header.startswith(b'FORM') and header[8:12] in (b'AIFF', b'AIFC')
+            is_webm = header.startswith(b'\x1a\x45\xdf\xa3')  # EBML (WebM/MKV)
+
+            if not (is_wav or is_mp3 or is_flac or is_ogg or is_mp4 or is_aiff or is_webm):
+                validation_info["issues"].append("Unrecognized audio format (not WAV/MP3/FLAC/OGG/M4A/AIFF/WebM)")
+                logger.error(f"[{context}] Audio validation failed: Unrecognized audio format")
                 return False, validation_info
 
-            # Extract file size from header
-            import struct
-            data_size = struct.unpack('<I', header[4:8])[0]
-            expected_size = data_size + 8
-            if len(audio_data) < expected_size:
-                validation_info["warnings"].append(f"Audio file truncated (actual: {len(audio_data)}, expected: {expected_size})")
-                logger.warning(f"[{context}] Audio warning: File may be truncated")
+            # WAV 额外做完整性检查（其他格式的深度校验交给后续 ffmpeg 解码）
+            if is_wav:
+                import struct
+                data_size = struct.unpack('<I', header[4:8])[0]
+                expected_size = data_size + 8
+                if len(audio_data) < expected_size:
+                    validation_info["warnings"].append(f"Audio file truncated (actual: {len(audio_data)}, expected: {expected_size})")
+                    logger.warning(f"[{context}] Audio warning: File may be truncated")
 
             validation_info["data_size_bytes"] = len(audio_data)
             validation_info["is_valid"] = True

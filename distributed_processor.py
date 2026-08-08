@@ -169,6 +169,8 @@ class DistributedProcessor:
         Returns:
             Merged SRT content
         """
+        workers_to_use = []  # finally 块兜底：异常发生在赋值前时引用不到
+        distributed_count_acquired = False  # 计数器只在真正获取后才允许递减
         try:
             logger.info(f"Starting distributed processing with {len(available_backends)} workers")
 
@@ -248,6 +250,7 @@ class DistributedProcessor:
 
                 # Increment counter
                 self.current_distributed_count += 1
+                distributed_count_acquired = True
                 logger.info(f"Starting distributed processing. Active distributed jobs: {self.current_distributed_count}")
 
             # Split audio file using enhanced splitter
@@ -306,20 +309,24 @@ class DistributedProcessor:
 
         finally:
             # Always decrement the counter and clear busy backends, even if an exception occurred
-            async with self.distributed_lock:
-                self.current_distributed_count -= 1
-                logger.info(f"Distributed processing completed. Active distributed jobs: {self.current_distributed_count}")
+            # 注意：只在真正获取过计数器时才递减，否则早期异常会把计数减成负数
+            if distributed_count_acquired:
+                async with self.distributed_lock:
+                    self.current_distributed_count -= 1
+                    logger.info(f"Distributed processing completed. Active distributed jobs: {self.current_distributed_count}")
 
             # Clear busy backends - this is critical for proper cleanup
-            async with self.backend_lock:
-                cleared_backends = []
-                for backend in workers_to_use:
-                    if backend in self.busy_backends:
-                        self.busy_backends.remove(backend)
-                        cleared_backends.append(backend)
-                        logger.info(f"Marked backend {backend} as available after distributed processing")
-                if cleared_backends:
-                    logger.info(f"Cleared {len(cleared_backends)} backends from busy state: {cleared_backends}")
+            # workers_to_use 可能因早期异常仍为空列表，此时无需清理
+            if workers_to_use:
+                async with self.backend_lock:
+                    cleared_backends = []
+                    for backend in workers_to_use:
+                        if backend in self.busy_backends:
+                            self.busy_backends.remove(backend)
+                            cleared_backends.append(backend)
+                            logger.info(f"Marked backend {backend} as available after distributed processing")
+                    if cleared_backends:
+                        logger.info(f"Cleared {len(cleared_backends)} backends from busy state: {cleared_backends}")
 
     async def _process_chunks_parallel(
         self,
