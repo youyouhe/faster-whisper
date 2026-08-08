@@ -2,7 +2,7 @@
 
 # --- Core faster-whisper dependencies ---
 ctranslate2>=4.0,<5
-huggingface_hub>=0.13
+huggingface_hub>=0.23
 tokenizers>=0.13,<1
 onnxruntime>=1.14,<2
 numpy>=1.21.0
@@ -26,4 +26,3 @@ nvidia-ml-py>=11.0.0
 # --- PyTorch ---
 # 强烈建议手动安装，而不是放在这里。
 # torch>=1.10.0 (您注释掉了，这是对的)
-
