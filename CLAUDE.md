@@ -4,156 +4,93 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is Faster Whisper, a reimplementation of OpenAI's Whisper model using CTranslate2 for faster inference. It provides up to 4x faster transcription with the same accuracy while using less memory. The project includes both the core transcription library and a comprehensive API service with Docker deployment capabilities.
+This repo has **two distinct layers**:
 
-## Key Components
-
-### Core Library
-1. **WhisperModel** - Main class for transcription with various options (`faster_whisper/transcribe.py:606-1828`)
-2. **BatchedInferencePipeline** - For batched transcription processing (`faster_whisper/transcribe.py:111-604`)
-3. **Tokenizer** - Handles text tokenization for different languages
-4. **FeatureExtractor** - Processes audio into features for the model
-5. **VAD (Voice Activity Detection)** - Filters out non-speech audio segments
-
-### API Service Architecture
-The system implements a distributed processing architecture:
-- **Load Balancer** (`load_balancer.py`) - Distributes requests across GPU services
-- **TUS Server** (`tus_server.py`) - Resumable file uploads using TUS protocol
-- **ASR Worker** (`asr_worker.py`) - Coordinates transcription tasks
-- **Message Queue** (`message_queue.py`) - Redis-based task management
+1. **Upstream library** — a fork of SYSTRAN/faster-whisper (CTranslate2-based Whisper inference). Lives in `faster_whisper/` with its pytest suite in `tests/`. Relatively untouched.
+2. **Production Chinese ASR service** — a custom distributed transcription system built at the **repo root** (`*.py` files, `docker/`, shell scripts). This is where nearly all active development happens (current branch: VAD-guided audio splitting).
 
 ## Development Commands
 
 ### Installation
 ```bash
-# Core library with dev dependencies
-pip install -e .[dev]
-
-# API service dependencies
-pip install pydub>=0.25.1 numpy>=1.21.0
+pip install -e .[dev]          # core library + dev tools
+pip install -r requirements.txt  # full service dependencies
+# torch is deliberately NOT in requirements.txt — install manually (needed by silero VAD)
 ```
 
-### Running Tests
+### Tests
 ```bash
-pytest -v tests/
+pytest -v tests/                          # upstream library suite (no server/GPU needed)
+pytest tests/test_transcribe.py -k jfk    # single test by name
 ```
 
-### Code Formatting
+The root-level `test_*.py` files are **ad-hoc scripts, not pytest tests** — run them with `python3`:
+- `test_vad_splitting.py`, `test_audio_splitting_optimization.py`, `test_srt_merging_only.py` — pure logic, runnable locally.
+- `test_enhanced_splitting.py` — needs real audio; **contains a stale hardcoded path `/home/cat/faster-whisper/66.wav`** (fix to repo root before running).
+- `test_load_balancer.py`, `test_stats.py`, `test_async_api.py` — **require a live server** (load balancer on :5001, async API on :5020).
+- `tus_client.py` doubles as the end-to-end test client; it writes results to `verification_results/` (server never writes there).
+
+### Formatting / Linting (upstream CI enforces on `master` only)
 ```bash
-# Check formatting
-black --check .
-isort --check-only .
-
-# Apply formatting
-black .
-isort .
+black . && isort . && flake8 .
 ```
 
-### Linting
+### Running the service
 ```bash
-flake8 .
+docker-compose up --build              # full stack (see architecture below)
+./start_dynamic_services.sh            # host: one faster_whisper_api.py per GPU + load balancer
+./start_multi_instance_per_gpu.sh      # host: INSTANCES_PER_GPU instances per GPU
 ```
 
-### Building Package
-```bash
-python3 setup.py sdist bdist_wheel
-```
+## Service Architecture
 
-### Docker Deployment
-```bash
-# Build and start all services
-docker-compose up --build
-
-# Start multi-GPU instances
-./start_multi_instance.sh
-
-# Start load balancer
-./start_load_balancer.sh
-```
-
-## Project Structure
-
-- `faster_whisper/` - Main package directory
-  - `transcribe.py` - Core transcription logic with WhisperModel and BatchedInferencePipeline
-  - `tokenizer.py` - Tokenization utilities
-  - `feature_extractor.py` - Audio feature extraction
-  - `vad.py` - Voice activity detection
-  - `audio.py` - Audio decoding and processing
-  - `utils.py` - Utility functions
-- `tests/` - Test suite
-- `docker/` - Docker configuration files
-- `data/` - Data storage for uploads and results
-
-## Distributed Architecture
-
-The service architecture supports high-throughput transcription across multiple GPU instances:
+Request lifecycle: upload → queue → GPU processing → result → callback.
 
 ```
-Client Apps → Load Balancer (Port 5001) → Backend Services (Ports 5002-5008)
-     ↓              ↓                        ↓
-Large Files    Queue System        GPU Instances
-Concurrent     Round-Robin        File Chunking
-Requests       Health Checks      Serial Processing
+Client → tus_server (:1080, resumable uploads) / tus_api_server (:8000)
+       → Redis queues (tus:upload_completed → tus:asr_processing → tus:asr_completed/failed)
+       → asr_worker (:8081, consumes queue, posts audio to load balancer)
+       → load_balancer (:5001, round-robin + health checks)
+       → faster_whisper_api backends (:5002+, one per GPU, CUDA_VISIBLE_DEVICES per instance)
+       → callback_service (posts result to client URL with retries)
 ```
 
-### Key Features
-- **TUS Protocol Support**: Resumable uploads for reliable file transfers
-- **Multi-GPU Load Balancing**: Automatic distribution across available GPUs
-- **Redis Message Queue**: Asynchronous task management
-- **Health Monitoring**: Continuous service health checks
-- **Callback Service**: HTTP callbacks for async result delivery
+Key files at repo root:
+- `load_balancer.py` — request distribution; auto-generates backend list from `NUM_GPUS`/`INSTANCES_PER_GPU`/`START_PORT` if `BACKEND_SERVICES` is unset.
+- `distributed_processor.py` — splits files > `DISTRIBUTED_THRESHOLD_MB` (10MB) into chunks, fans out to backends, merges resulting SRTs.
+- `message_queue.py` — Redis queue names and task state.
+- `tus_client.py` — reference client / E2E test driver.
 
-## Key Dependencies
+Compose mounts `./:/app` into the dynamic/worker/callback containers — code edits need a container restart to take effect.
 
-### Core Library
-- `ctranslate2>=4.0,<5` - Fast inference engine
-- `huggingface_hub>=0.13` - Model downloading
-- `tokenizers>=0.13,<1` - Text tokenization
-- `onnxruntime>=1.14,<2` - ONNX runtime support
-- `av>=11` - Audio/video processing
-- `numpy>=1.21.0` - Numerical computing
+## Audio Splitting & SRT Merging (current branch focus)
 
-### API Service
-- `fastapi>=0.68.0` - Web framework
-- `uvicorn>=0.15.0` - ASGI server
-- `aiohttp>=3.8.0` - Async HTTP client/server
-- `torch>=1.10.0` - PyTorch for ML operations
-- `redis` - Message queue and caching
-- `psutil>=7.0.0` - System monitoring
+Goal: split long audio for distributed transcription **without timeline corruption or duplicated content**.
 
-## Configuration
+- **VAD-guided split points** (`audio_splitter_enhanced.py`, `hybrid_vad_detector.py`): split at silences > 0.3s near the theoretical chunk boundary (score = `distance / (duration + 0.1)`); falls back to even splitting. Hybrid VAD combines librosa energy VAD (sensitive) with silero-vad (precise); recent commits add progressive/adaptive silence thresholds for continuous speech.
+- **Overlap reduced 2.0s → 0.5s**; `OVERLAP_SECONDS` defaults to 0.0 in `distributed_processor.py` (config in `audio_splitter_config.env`, which is **sourced by shell scripts, not auto-loaded by Python**).
+- **Timestamp alignment is the hard part**: each chunk tracks both *theoretical* (even-split) and *actual* (VAD-adjusted) start/end — passed around as `(actual_start, actual_end, theoretical_start, theoretical_end)` tuples. `srt_merger.py` maps per-chunk relative timestamps back to global time and strips overlap regions; dedup uses SequenceMatcher similarity.
+- Known pain points (see `WORK_SUMMARY_2025-11-09.md`): merge strategy flip-flopped between over-fragmented (229 subtitles) and over-merged (1 subtitle); negative-time bugs. **Test the no-merge baseline first, then add merging incrementally.**
+- `preprocess_audio.py` — standalone ffmpeg wrapper: converts input to 16kHz mono WAV.
 
-### Environment Variables
-- `MAX_QUEUE_SIZE` - Queue management (default: 10)
-- `MAX_FILE_SIZE` - File size limit in MB (default: 20)
-- `GPU_DEVICE_ID` - GPU device selection
-- `API_PORT` - Service port configuration
-- `API_KEY` - Authentication for API access
+## Environment Variables (key ones)
 
-## Performance Optimizations
+- **GPU backends**: `API_PORT`, `GPU_DEVICE_ID`, `INSTANCE_ID`, `MAX_FILE_SIZE` (20MB in `faster_whisper_api.py`, 500MB in `tus_server.py` — intentional, TUS handles large uploads), `CHUNK_TIMEOUT`/`REQUEST_TIMEOUT` (3600).
+- **Load balancer**: `BACKEND_SERVICES` (CSV), `LB_PORT`, `NUM_GPUS`, `INSTANCES_PER_GPU`, `START_PORT`, `REQUEST_TIMEOUT` (1800), `LARGE_FILE_THRESHOLD` (50MB), `DATABASE_PATH`, `UPLOAD_DIR`.
+- **Distributed processing**: `DISTRIBUTED_THRESHOLD_MB`, `OVERLAP_SECONDS`, `MIN_CHUNK_SIZE_MB`, `USE_ENHANCED_SPLITTER`, `MAX_CONCURRENT_DISTRIBUTED`.
+- **Shared**: `API_KEY` (unset = open access), `REDIS_URL` (default `redis://redis:6379` — the **docker hostname**; override for bare-host runs), `SRT_STORAGE_DIR`, `LOAD_BALANCER_URL`.
 
-- **Batched Processing**: Use `BatchedInferencePipeline` for multiple segments
-- **VAD Filtering**: Enable VAD to remove silence and reduce processing time
-- **Memory Management**: 20MB chunk limits prevent memory overflow
-- **Quantization Support**: INT8 quantization for reduced memory usage
+## Operational Gotchas
 
-## Core Classes
+- **GPU/CUDA required** for the service: backends load `WhisperModel("large-v3-turbo", compute_type="float32")` (float32 is deliberate for accuracy); model load takes **2–3 minutes per instance**. Warmup uses a `tiny` int8 model.
+- Start scripts set `LD_LIBRARY_PATH` from pip-installed `nvidia.cublas.lib`/`nvidia.cudnn.lib` packages.
+- Start scripts assume CWD `/app` (container layout).
+- `Dockerfile.worker` healthcheck ends with `|| 1` (never fails — likely a bug).
+- SQLite DBs (`tus_uploads.db`, `data/tasks.db`) live in-repo; `data/` holds uploads and SRT results.
 
-### WhisperModel
-Main class for transcription with methods:
-- `transcribe()` - Transcribe audio files with various options
-- `detect_language()` - Detect language in audio
-- `generate_segments()` - Generate transcription segments
+## Core Library (upstream fork)
 
-### BatchedInferencePipeline
-For batched processing:
-- `transcribe()` - Batched transcription with significant performance improvements
-
-## Testing
-
-Tests are written using pytest and can be run with:
-```bash
-pytest -v tests/
-```
-
-Test data is available in `tests/data/` with sample audio files for testing transcription functionality.
+- `faster_whisper/transcribe.py` — `WhisperModel` (main transcription class) and `BatchedInferencePipeline` (batched processing, significant speedup).
+- `faster_whisper/vad.py` — VAD filtering; `get_speech_timestamps` is reused by the root-level hybrid VAD.
+- `faster_whisper/audio.py` — audio decoding (av-based); `feature_extractor.py` — mel features; `tokenizer.py` — text tokenization.
+- Core deps: `ctranslate2>=4.0,<5`, `huggingface_hub>=0.13`, `tokenizers>=0.13,<1`, `onnxruntime>=1.14,<2`, `av>=11`. Python >= 3.9.

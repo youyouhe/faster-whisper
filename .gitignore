@@ -34,3 +34,11 @@ data/uploads/*
 data/srt_results/*
 *.bak
 docker/backup_original/
+
+# Runtime artifacts
+logs/
+.api_pid
+verification_results/
+srt_results/
+result_*.srt
+vad-test/
