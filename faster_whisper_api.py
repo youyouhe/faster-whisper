@@ -14,7 +14,6 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 import uvicorn
 from faster_whisper import WhisperModel
-import re
 import asyncio
 from collections import deque
 import signal
@@ -26,6 +25,14 @@ import numpy as np
 
 # Import authentication middleware
 from auth_middleware import get_auth, require_auth
+
+# 共享字幕切段策略（与 qwen_whisper_api.py 对齐）
+from subtitle_splitter import (
+    MAX_CHARS_PER_SEGMENT,
+    clean_text,
+    split_tokens,
+    suppress_micro_blocks,
+)
 
 # Statistics tracking
 from dataclasses import dataclass, field
@@ -260,21 +267,6 @@ processing_lock = asyncio.Lock()
 current_processing_tasks = 0
 max_concurrent_tasks = 1  # Serial processing by default
 
-def clean_text(text):
-    """Clean text by removing extra spaces and normalizing punctuation"""
-    if not text:
-        return text
-    # Remove extra spaces around punctuation
-    text = re.sub(r'\s+([,.!?;:，。！？；：])', r'\1', text)
-    # Remove extra spaces between Chinese characters and punctuation
-    text = re.sub(r'([^\s])\s+([,.!?;:，。！？；：])', r'\1\2', text)
-    # Remove multiple consecutive spaces
-    text = re.sub(r'\s+', ' ', text)
-    # Strip leading/trailing whitespace
-    text = text.strip()
-    return text
-
-
 def split_audio_file(file_path: str, max_size_mb: int = 100) -> List[str]:
     """Split large audio file into smaller chunks"""
     try:
@@ -456,8 +448,11 @@ def format_timestamp_srt(seconds):
     
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-def transcribe_to_srt(file_path: str, language: str = "auto", max_words_per_segment: int = 15, timeout: int = 1800):
-    """Transcribe audio file to SRT format with enhanced timeout protection and progress monitoring"""
+def transcribe_to_srt(file_path: str, language: str = "auto", timeout: int = 1800):
+    """Transcribe audio file to SRT format with enhanced timeout protection and progress monitoring.
+
+    字幕段按显示宽度切段（MAX_CHARS_PER_SEGMENT 环境变量，默认 15；CJK=1/ASCII=0.5），
+    策略见 subtitle_splitter.py，与 qwen_whisper_api.py 共用。"""
     global model
 
     # 根据文件大小动态调整超时时间
@@ -522,99 +517,71 @@ def transcribe_to_srt(file_path: str, language: str = "auto", max_words_per_segm
             # Timing for SRT generation
             srt_generation_start = time.time()
             
-            # Generate SRT content
+            # Generate SRT content（按显示宽度切段，策略见 subtitle_splitter.py）
             srt_lines = []
             segment_index = 1
             total_words = 0
-            
+            all_blocks = []      # [(start, end, text)] 全文件汇总后统一做微块抑制
+            prev_end = None
+
             # Debug timing for processing
             processing_start = time.time()
-            long_segments_count = 0
-            short_segments_count = 0
-            total_chunks = 0
-            
+            segments_split_count = 0    # 被切成多块的 segment 数
+            passthrough_count = 0       # 整段一块直出的 segment 数
+
             print(f"Debug Info - Starting SRT generation for {len(segments_list)} segments")
-            
+
             # Process all segments
             for segment_idx, segment in enumerate(segments_list):
-                segment_start = time.time()
-                
                 if segment.words:
                     total_words += len(segment.words)
-                
+
                 # Only process non-empty segments
-                if segment.text.strip():
-                    # Check if we need to split this segment
-                    if segment.words and len(segment.words) > max_words_per_segment:
-                        long_segments_count += 1
-                        # Split into smaller chunks
-                        words = segment.words
-                        chunk_processing_start = time.time()
-                        for i in range(0, len(words), max_words_per_segment):
-                            chunk_words = words[i:i + max_words_per_segment]
-                            if chunk_words:
-                                total_chunks += 1
-                                start_time = chunk_words[0].start
-                                end_time = chunk_words[-1].end
-                                # Extract words and clean up spacing
-                                word_extract_start = time.time()
-                                word_texts = [word.word for word in chunk_words]
-                                word_extract_time = time.time() - word_extract_start
-                                
-                                text_join_start = time.time()
-                                text = "".join(word_texts)  # For Chinese, no spaces needed
-                                text_join_time = time.time() - text_join_start
-                                
-                                clean_start = time.time()
-                                # Only clean text if it's not empty
-                                if text.strip():
-                                    text = clean_text(text)
-                                clean_time = time.time() - clean_start
-                                
-                                if text.strip():  # Only add non-empty segments
-                                    srt_lines.append(f"{segment_index}")
-                                    srt_lines.append(f"{format_timestamp_srt(start_time)} --> {format_timestamp_srt(end_time)}")
-                                    srt_lines.append(f"{text}")
-                                    srt_lines.append("")  # Empty line
-                                    segment_index += 1
-                                
-                                # Log chunk processing time periodically
-                                if total_chunks % 20 == 0:
-                                    chunk_total_time = time.time() - chunk_processing_start
-                                    print(f"Debug Info - Processed {total_chunks} chunks, "
-                                          f"Word extract: {word_extract_time:.6f}s, "
-                                          f"Text join: {text_join_time:.6f}s, "
-                                          f"Clean: {clean_time:.6f}s, "
-                                          f"Total chunk time: {chunk_total_time:.6f}s")
-                                    chunk_processing_start = time.time()
-                    else:
-                        short_segments_count += 1
-                        # No splitting needed, process as is
-                        clean_start = time.time()
-                        cleaned_text = clean_text(segment.text)
-                        clean_time = time.time() - clean_start
-                        
-                        if cleaned_text.strip():  # Only add non-empty segments
-                            srt_lines.append(f"{segment_index}")
-                            srt_lines.append(f"{format_timestamp_srt(segment.start)} --> {format_timestamp_srt(segment.end)}")
-                            srt_lines.append(f"{cleaned_text}")
-                            srt_lines.append("")  # Empty line
-                            segment_index += 1
-                    
-                    # Log segment processing time periodically
-                    if (long_segments_count + short_segments_count) % 10 == 0:
-                        segment_time = time.time() - segment_start
-                        print(f"Debug Info - Processed {long_segments_count + short_segments_count} segments, "
-                              f"Last segment time: {segment_time:.6f}s")
-                
+                if not segment.text.strip():
+                    continue
+
+                if segment.words:
+                    # 词级时间戳切段：CJK 计 1、ASCII 计 0.5 的显示宽度，
+                    # 优先在句末/从句标点处断，绝不切开词内部
+                    tokens = [(w.start, w.end, w.word) for w in segment.words]
+                    blocks = split_tokens(tokens)
+                else:
+                    # 无词级时间戳的兜底：整段直出（word_timestamps=True 时不会走到）
+                    text = clean_text(segment.text)
+                    blocks = [(segment.start, segment.end, text)] if text else []
+
+                if len(blocks) > 1:
+                    segments_split_count += 1
+                elif blocks:
+                    passthrough_count += 1
+
+                for start, end, text in blocks:
+                    # 全局时间单调钳位：保证 srt_merger 不会把相邻块重新拼成长行
+                    if prev_end is not None and start < prev_end:
+                        start = prev_end
+                    end = max(end, start + 0.001)
+                    prev_end = end
+                    all_blocks.append((start, end, text))
+
                 # Log overall progress periodically
                 if segment_idx > 0 and segment_idx % 20 == 0:
                     elapsed = time.time() - processing_start
                     print(f"Debug Info - Processed {segment_idx}/{len(segments_list)} segments in {elapsed:.2f}s")
-            
+
+            # 微块抑制：过短（宽度/时长）的块并入前一块，消除"五"这类孤块
+            all_blocks = suppress_micro_blocks(all_blocks)
+
+            for start, end, text in all_blocks:
+                srt_lines.append(f"{segment_index}")
+                srt_lines.append(f"{format_timestamp_srt(start)} --> {format_timestamp_srt(end)}")
+                srt_lines.append(f"{text}")
+                srt_lines.append("")  # Empty line
+                segment_index += 1
+
             processing_time = time.time() - processing_start
-            print(f"Debug Info - SRT processing completed: {long_segments_count} long segments, "
-                  f"{short_segments_count} short segments, {total_chunks} chunks, "
+            print(f"Debug Info - SRT processing completed: {len(segments_list)} segments, "
+                  f"{segments_split_count} split, {passthrough_count} whole, "
+                  f"{len(all_blocks)} subtitle blocks (width cap {MAX_CHARS_PER_SEGMENT}), "
                   f"Processing time: {processing_time:.2f}s")
             
             # Join all lines at once for better performance
